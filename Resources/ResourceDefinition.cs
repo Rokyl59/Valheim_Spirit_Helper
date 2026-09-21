@@ -30,24 +30,26 @@ public sealed class ResourceDefinition
 
     public ResourceDefinition(string name, ResourceCategory category, IEnumerable<string> prefabs,
         IEnumerable<string> drops, int professionLevel, RequiredToolType tool, int tier,
-        ResourceDamageType damageType, float energyCost, float xp, Profession profession)
+        ResourceDamageType damageType, float energyCost, float xp, Profession profession,
+        int spiritLevel = 1, float searchRadius = 50f, float workInterval = 1.5f,
+        float? professionXp = null, bool canAutoHarvest = true, bool canAutoTransport = true)
     {
         Name = name;
         Category = category;
         PrefabNames = new HashSet<string>(prefabs, StringComparer.OrdinalIgnoreCase);
         DropNames = new HashSet<string>(drops, StringComparer.OrdinalIgnoreCase);
-        RequiredSpiritLevel = 1;
+        RequiredSpiritLevel = spiritLevel;
         RequiredProfessionLevel = professionLevel;
         RequiredToolType = tool;
         MinToolTier = tier;
         DamageType = damageType;
-        SearchRadius = 50f;
-        WorkInterval = 1.5f;
+        SearchRadius = searchRadius;
+        WorkInterval = workInterval;
         EnergyCost = energyCost;
         XpReward = xp;
-        ProfessionXpReward = xp;
+        ProfessionXpReward = professionXp ?? xp;
         Profession = profession;
-        CanAutoHarvest = true;
-        CanAutoTransport = true;
+        CanAutoHarvest = canAutoHarvest;
+        CanAutoTransport = canAutoTransport;
     }
 }

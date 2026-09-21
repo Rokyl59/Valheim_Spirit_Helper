@@ -32,11 +32,19 @@ public sealed class SpiritAudioController
     public void Register(SpiritAudioEvent audioEvent, params AudioClip[] variants) => _clips[audioEvent] = variants;
     public void RegisterProceduralDefaults()
     {
-        var soft = CreateTone("SpiritSoft", 660f, 0.11f, 0.12f);
-        var work = CreateTone("SpiritWork", 420f, 0.09f, 0.18f);
-        var warning = CreateTone("SpiritWarning", 220f, 0.16f, 0.18f);
+        var soft = CreateVoice("SpiritSoft", 660f, 820f, 0.14f, 0.12f, 0.02f);
+        var work = CreateVoice("SpiritWork", 420f, 330f, 0.1f, 0.18f, 0.08f);
+        var warning = CreateVoice("SpiritWarning", 260f, 160f, 0.22f, 0.2f, 0.14f);
+        var joy = CreateVoice("SpiritJoy", 520f, 1040f, 0.3f, 0.14f, 0.025f);
+        var discovery = CreateVoice("SpiritDiscovery", 440f, 880f, 0.24f, 0.12f, 0.04f);
         foreach (SpiritAudioEvent audioEvent in System.Enum.GetValues(typeof(SpiritAudioEvent)))
             Register(audioEvent, audioEvent is SpiritAudioEvent.NoTool or SpiritAudioEvent.InvalidTarget or SpiritAudioEvent.InvalidZone ? warning : audioEvent is SpiritAudioEvent.WoodHit or SpiritAudioEvent.MiningHitOre or SpiritAudioEvent.MiningHitStone ? work : soft);
+        Register(SpiritAudioEvent.SpiritLevelUp, joy);
+        Register(SpiritAudioEvent.ProfessionLevelUp, joy);
+        Register(SpiritAudioEvent.JobComplete, joy);
+        Register(SpiritAudioEvent.TargetFound, discovery);
+        Register(SpiritAudioEvent.ScanPulse, discovery);
+        Register(SpiritAudioEvent.DangerDetected, warning);
         Register(SpiritAudioEvent.IdleAmbient,
             CreateTone("SpiritAmbient1", 740f, 0.32f, 0.08f),
             CreateTone("SpiritAmbient2", 880f, 0.24f, 0.065f),
@@ -69,6 +77,30 @@ public sealed class SpiritAudioController
         {
             var envelope = 1f - index / (float)samples;
             data[index] = Mathf.Sin(2f * Mathf.PI * frequency * index / sampleRate) * amplitude * envelope;
+        }
+        var clip = AudioClip.Create(name, samples, 1, sampleRate, false);
+        clip.SetData(data, 0);
+        return clip;
+    }
+
+    private static AudioClip CreateVoice(string name, float startFrequency, float endFrequency, float duration,
+        float amplitude, float noiseAmount)
+    {
+        const int sampleRate = 44100;
+        var samples = Mathf.CeilToInt(sampleRate * duration);
+        var data = new float[samples];
+        var phase = 0f;
+        for (var index = 0; index < samples; index++)
+        {
+            var progress = index / (float)samples;
+            var attack = Mathf.Clamp01(progress / 0.08f);
+            var release = Mathf.Pow(1f - progress, 1.8f);
+            var frequency = Mathf.Lerp(startFrequency, endFrequency, progress * progress);
+            phase += 2f * Mathf.PI * frequency / sampleRate;
+            var sine = Mathf.Sin(phase);
+            var triangle = 2f * Mathf.Asin(sine) / Mathf.PI;
+            var noise = Random.Range(-1f, 1f) * noiseAmount;
+            data[index] = (sine * 0.65f + triangle * 0.3f + noise) * amplitude * attack * release;
         }
         var clip = AudioClip.Create(name, samples, 1, sampleRate, false);
         clip.SetData(data, 0);

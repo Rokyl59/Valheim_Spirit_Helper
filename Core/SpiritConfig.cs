@@ -8,6 +8,7 @@ public sealed class SpiritConfig
     public ConfigEntry<BalanceMode> BalanceMode { get; }
     public ConfigEntry<KeyboardShortcut> MenuKey { get; }
     public ConfigEntry<float> WorkRadius { get; }
+    public ConfigEntry<bool> ShowWorkZone { get; }
     public ConfigEntry<float> MaxWorkRadius { get; }
     public ConfigEntry<float> MaxDistanceFromPlayer { get; }
     public ConfigEntry<float> SearchInterval { get; }
@@ -53,6 +54,7 @@ public sealed class SpiritConfig
         BalanceMode = file.Bind("Баланс", "Режим", Core.BalanceMode.Vanilla, "Режим баланса: Vanilla, Balanced или Free.");
         MenuKey = file.Bind("Управление", "Открыть меню", new KeyboardShortcut(KeyCode.G), "Единственная горячая клавиша мода. Остальные действия находятся в меню.");
         WorkRadius = file.Bind("Рабочая зона", "Радиус работы", 50f, new ConfigDescription("Радиус рабочей зоны в метрах.", new AcceptableValueRange<float>(5f, 150f)));
+        ShowWorkZone = file.Bind("Рабочая зона", "Показывать границу", true, "Показывать светящуюся границу рабочей зоны.");
         MaxWorkRadius = file.Bind("Рабочая зона", "Максимальный радиус", 150f, "Жёсткое ограничение радиуса рабочей зоны.");
         MaxDistanceFromPlayer = file.Bind("Рабочая зона", "Максимальная дальность от игрока", 80f, "Дух отменяет цель дальше этого расстояния.");
         SearchInterval = file.Bind("Поведение", "Интервал поиска", 1f, new ConfigDescription("Пауза между сканированиями в секундах.", new AcceptableValueRange<float>(0.25f, 10f)));

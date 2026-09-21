@@ -62,7 +62,7 @@ public sealed class CarrySystem
             var drop = _hits[index] ? _hits[index].GetComponentInParent<ItemDrop>() : null;
             if (!drop || Contains(drop)) continue;
             var definition = _database.ByDrop(drop.gameObject.name);
-            if (definition == null || !selection.Allows(definition) || jobFilter != null && !jobFilter(definition)) continue;
+            if (definition == null || !definition.CanAutoTransport || !selection.Allows(definition) || jobFilter != null && !jobFilter(definition)) continue;
             var dropWeight = Weight(drop);
             if (weight + dropWeight > maxWeight) { _blockedByCapacity = true; continue; }
             var view = drop.GetComponent<ZNetView>();
@@ -86,7 +86,7 @@ public sealed class CarrySystem
             var drop = _hits[index] ? _hits[index].GetComponentInParent<ItemDrop>() : null;
             if (!drop || Contains(drop)) continue;
             var definition = _database.ByDrop(drop.gameObject.name);
-            if (definition == null || !selection.Allows(definition)) continue;
+            if (definition == null || !definition.CanAutoTransport || !selection.Allows(definition)) continue;
             var distance = Vector3.SqrMagnitude(drop.transform.position - centre);
             if (distance >= nearestDistance) continue;
             nearest = drop;
@@ -138,6 +138,15 @@ public sealed class CarrySystem
         return false;
     }
 
+    public ResourceDefinition? FirstDefinition
+    {
+        get
+        {
+            foreach (var cargo in _carried) if (cargo.Drop) return cargo.Definition;
+            return null;
+        }
+    }
+
     public int Unload(Vector3 point, float radius, Func<ResourceDefinition, bool> accepts)
     {
         var delivered = 0;
@@ -166,11 +175,79 @@ public sealed class CarrySystem
         return delivered;
     }
 
+    public int UnloadToContainer(Container container, Func<ResourceDefinition, bool> accepts)
+    {
+        if (!container || !PrivateArea.CheckAccess(container.transform.position, 0f, false, false)) return 0;
+        var containerView = container.GetComponent<ZNetView>();
+        if (!containerView || !containerView.IsValid()) return 0;
+        if (!containerView.IsOwner()) { containerView.ClaimOwnership(); return 0; }
+        var inventory = container.GetInventory();
+        var delivered = 0;
+        for (var index = _carried.Count - 1; index >= 0; index--)
+        {
+            var cargo = _carried[index];
+            if (!cargo.Drop || !accepts(cargo.Definition)) continue;
+            var dropView = cargo.Drop.GetComponent<ZNetView>();
+            if (!dropView || !dropView.IsValid()) continue;
+            if (!dropView.IsOwner()) { cargo.Drop.RequestOwn(); continue; }
+            if (!inventory.AddItem(cargo.Drop.m_itemData.Clone())) continue;
+            if (cargo.Visual) UnityEngine.Object.Destroy(cargo.Visual);
+            if (ZNetScene.instance) ZNetScene.instance.Destroy(cargo.Drop.gameObject);
+            else UnityEngine.Object.Destroy(cargo.Drop.gameObject);
+            _carried.RemoveAt(index);
+            delivered++;
+        }
+        _blockedByCapacity = false;
+        return delivered;
+    }
+
+    public bool TryWithdraw(Container container, Vector3 dropPosition, int maxStacks, float maxWeight,
+        ResourceSelection selection)
+    {
+        if (!container || !PrivateArea.CheckAccess(container.transform.position, 0f, false, false) || IsFull(maxStacks, maxWeight))
+            return false;
+        var view = container.GetComponent<ZNetView>();
+        if (!view || !view.IsValid()) return false;
+        if (!view.IsOwner()) { view.ClaimOwnership(); return false; }
+        var inventory = container.GetInventory();
+        foreach (var item in inventory.GetAllItems())
+        {
+            if (!item.m_dropPrefab) continue;
+            var definition = _database.ByDrop(item.m_dropPrefab.name);
+            if (definition == null || !definition.CanAutoTransport || !selection.Allows(definition)) continue;
+            var clone = item.Clone();
+            if (_carried.Count + _pending.Count >= maxStacks || CurrentWeight + clone.m_shared.m_weight * clone.m_stack > maxWeight)
+                return false;
+            if (!inventory.RemoveItem(item)) return false;
+            var drop = ItemDrop.DropItem(clone, clone.m_stack, dropPosition, Quaternion.identity);
+            if (!drop) return false;
+            return TryCollect(dropPosition, maxStacks, maxWeight, selection);
+        }
+        return false;
+    }
+
     public void CancelPending() => _pending.Clear();
 
     public void Release()
     {
         foreach (var cargo in _carried) Restore(cargo);
+        _carried.Clear();
+        _pending.Clear();
+        _blockedByCapacity = false;
+    }
+
+    public void Release(Vector3 point)
+    {
+        var index = 0;
+        foreach (var cargo in _carried)
+        {
+            if (cargo.Drop)
+            {
+                var angle = index++ * 2.399963f;
+                cargo.Drop.transform.position = point + new Vector3(Mathf.Cos(angle), 0.4f, Mathf.Sin(angle));
+            }
+            Restore(cargo);
+        }
         _carried.Clear();
         _pending.Clear();
         _blockedByCapacity = false;

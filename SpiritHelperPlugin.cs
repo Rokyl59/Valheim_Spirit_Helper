@@ -10,7 +10,7 @@ public sealed class SpiritHelperPlugin : BaseUnityPlugin
 {
     public const string PluginGuid = "com.danil.spirithelper";
     public const string PluginName = "Spirit Helper";
-    public const string PluginVersion = "0.4.2";
+    public const string PluginVersion = "0.5.0";
     internal static ManualLogSource Log = null!;
     private SpiritController? _controller;
 
