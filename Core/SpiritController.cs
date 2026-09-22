@@ -4,6 +4,7 @@ using System.Linq;
 using SpiritHelper.AI;
 using SpiritHelper.Audio;
 using SpiritHelper.Logistics;
+using SpiritHelper.Logistics.Production;
 using SpiritHelper.Networking;
 using SpiritHelper.Persistence;
 using SpiritHelper.Progression;
@@ -15,26 +16,20 @@ using UnityEngine;
 
 namespace SpiritHelper.Core;
 
-public sealed class SpiritController : MonoBehaviour
+public sealed partial class SpiritController : MonoBehaviour
 {
-    private readonly struct SpiritAssignment
-    {
-        public SpiritJob Job { get; }
-        public int Quantity { get; }
-        public SpiritAssignment(SpiritJob job, int quantity) { Job = job; Quantity = quantity; }
-    }
-
     private SpiritConfig _config = null!;
     private readonly SaveManager _saveManager = new SaveManager();
     private SpiritProgression _progression = null!;
     private SpiritKnowledge _knowledge = null!;
-    private readonly WorldMarkers _markers = new WorldMarkers();
+    private WorldMarkers _markers = new WorldMarkers();
     private readonly SpiritUI _ui = new SpiritUI();
     private ResourceDatabase _resources = null!;
     private readonly ResourceSelection _resourceSelection = new ResourceSelection();
     private TargetScanner _scanner = null!;
     private VanillaInteractionHelper _interaction = null!;
     private CarrySystem _carry = null!;
+    private readonly ProductionLogisticsSystem _production = new ProductionLogisticsSystem();
     private SpiritVisualController? _visual;
     private SpiritAudioController? _audio;
     private SpiritTarget? _target;
@@ -65,11 +60,13 @@ public sealed class SpiritController : MonoBehaviour
     private readonly Dictionary<int, float> _targetBlacklist = new Dictionary<int, float>();
     private readonly Dictionary<int, int> _targetFailures = new Dictionary<int, int>();
     private float _celebrateUntil;
-    private readonly Queue<SpiritAssignment> _assignments = new Queue<SpiritAssignment>();
+    private readonly Queue<SpiritOrderData> _assignments = new Queue<SpiritOrderData>();
     private bool _queueMode;
     private int _selectedQuantity;
     private int _assignmentQuantity;
     private int _assignmentProgress;
+    private bool _finishingOrder;
+    private bool _resumeAfterRest;
     private Vector3 _lastVisualPosition;
     private float _containerUnloadStarted;
     private SpiritJob _assistWorkJob = SpiritJob.Gathering;
@@ -94,29 +91,117 @@ public sealed class SpiritController : MonoBehaviour
     private float _shrineSpeedMultiplier = 1f;
     private float _shrineScoutMultiplier = 1f;
     private float _nextEmotion;
+    private string _selectedZoneName = string.Empty;
+    public bool MenuOpen => _ui.MenuOpen;
 
     public void Initialize(SpiritConfig config)
     {
         _config = config;
         _resources = new ResourceDatabase();
-        _ui.SetResources(_resources.All);
+        _ui.SetResources(_resources.ItemChoices);
         _scanner = new TargetScanner(_resources);
         _interaction = new VanillaInteractionHelper();
         _carry = new CarrySystem(_resources);
+        _carry.Collected += OnResourceCollected;
+        _carry.Delivered += OnResourceDelivered;
+        _carry.IsForbidden = IsWorkPositionForbidden;
+        _carry.RemainingQuantity = () => _assignmentQuantity > 0
+            ? Math.Max(0, _assignmentQuantity - _assignmentProgress) : int.MaxValue;
         _ui.ActionSelected += HandleMenuAction;
-        _ui.ExactResourceSelected += name => SetExactFilter(name, ResourceName(name));
+        _ui.ExactResourceSelected += SelectMenuItem;
+        _ui.OrderQuantityChanged += quantity => { _selectedQuantity = Mathf.Clamp(quantity, 0, 9999); _ui.Notify($"Количество: {QuantityName(_selectedQuantity)}."); };
+        _ui.OrderCompletionChanged += job => _progression.Data.Automation.CompletionJob = job;
+        _ui.ActionValue = MenuActionValue;
+        _ui.RequiredLevel = MenuRequiredLevel;
+        _ui.ZoneNameChanged += name => _selectedZoneName = name.Trim();
+        _ui.WorkPlaceSelected += index =>
+        {
+            var zones = _progression.Data.Automation.NamedZones;
+            if (index < 0 || index >= zones.Count) { _markers.RemoveWorkZone(); return; }
+            var zone = zones[index];
+            _config.WorkRadius.Value = zone.Radius;
+            _markers.ZoneMode = WorkZoneMode.Circle;
+            _markers.SetWorkZone(SpiritKnowledge.ToVector(zone.Position), WorkRadius, _config.ShowWorkZone.Value);
+        };
+        _ui.DeliveryPlaceSelected += index =>
+        {
+            var zones = _progression.Data.Automation.NamedZones;
+            _orderDeliveryPoint = index >= 0 && index < zones.Count ? SpiritKnowledge.ToVector(zones[index].Position) : (Vector3?)null;
+        };
+        _production.SourceAllowed = candidate => _markers.ExportUnloadPoints().Any(saved =>
+            _markers.ResolveContainer(SpiritKnowledge.ToVector(saved.Position)) == candidate);
+        _production.IsForbidden = IsWorkPositionForbidden;
+        _production.OutputAllowed = (drop, selection) =>
+            _resources.ByDrop(drop.gameObject.name) is { } definition && definition.CanAutoTransport && selection.Allows(definition);
     }
 
     public void Shutdown()
     {
         _ui.Close();
-        if (_initialized) Persist();
+        if (_initialized)
+        {
+            Persist();
+            _initialized = false;
+        }
+        if (_visual != null) _production.Cancel(_lastVisualPosition);
         _carry?.Release();
         _markers.Dispose();
+        _audio?.Dispose();
         _visual?.Dispose();
+        _audio = null;
+        _visual = null;
     }
 
-    private float WorkRadius => Mathf.Min(_config.WorkRadius.Value, _config.MaxWorkRadius.Value);
+    private void ResetSession()
+    {
+        Shutdown();
+        _markers.RemoveUnload();
+        _markers.RemoveWorkZone();
+        _markers.RemoveForbiddenZone();
+        _markers = new WorldMarkers();
+        _visual = null;
+        _audio = null;
+        _initialized = false;
+        _assignments.Clear();
+        _targetBlacklist.Clear();
+        _targetFailures.Clear();
+        _target = null;
+        _job = SpiritJob.Follow;
+        _assignmentQuantity = 0;
+        _assignmentProgress = 0;
+        _finishingOrder = false;
+        _resumeAfterRest = false;
+        _resumeAfterThreat = false;
+        _buildAssistEnabled = false;
+        _processedWorkOrders.Clear();
+        _activeScheduleIndex = -1;
+        _orderDeliveryPoint = null;
+        _celebrateUntil = 0f;
+        _dropTrackingUntil = 0f;
+        _wasDead = false;
+        _scanner = new TargetScanner(_resources);
+        _expeditionEndsAt = 0f;
+        _expeditionReturning = false;
+        _expeditionFinds.Clear();
+        _guideDestination = null;
+        _baseAlarmReturnUntil = 0f;
+        _shrineBuffUntil = 0f;
+        _shrineScoutMultiplier = 1f;
+        _shrineSpeedMultiplier = 1f;
+        ResetLearning();
+        _carry = new CarrySystem(_resources)
+        {
+            IsForbidden = IsWorkPositionForbidden,
+            RemainingQuantity = () => _assignmentQuantity > 0 ? Math.Max(0, _assignmentQuantity - _assignmentProgress) : int.MaxValue
+        };
+        _carry.Collected += OnResourceCollected;
+        _carry.Delivered += OnResourceDelivered;
+        SpiritInputBridge.ClearRemotePing();
+    }
+
+    private float WorkRadius => Mathf.Min(_config.WorkRadius.Value *
+        (_initialized && _progression.Data.Automation.ShrineSet && _progression.Data.Automation.ShrineLevel >= 2 ? 1.2f : 1f),
+        _config.MaxWorkRadius.Value);
     private float EffectiveSearchRadius
     {
         get
@@ -132,7 +217,13 @@ public sealed class SpiritController : MonoBehaviour
     private void Update()
     {
         var player = Player.m_localPlayer;
-        if (!player) return;
+        if (!player)
+        {
+            if (_initialized) ResetSession();
+            return;
+        }
+        var worldId = ZNet.instance ? ZNet.instance.GetWorldUID() : 0L;
+        if (_initialized && (_saveKey != $"{worldId}-{player.GetPlayerID()}" || _visual is { IsAlive: false })) ResetSession();
         EnsureSpirit(player);
         HandleInput();
         _ui.HandleInput();
@@ -146,6 +237,8 @@ public sealed class SpiritController : MonoBehaviour
     {
         if (!_initialized)
         {
+            _resources.RefreshItemCatalog();
+            _ui.SetResources(_resources.ItemChoices);
             var worldId = ZNet.instance ? ZNet.instance.GetWorldUID() : 0L;
             _saveKey = $"{worldId}-{player.GetPlayerID()}";
             var data = _saveManager.Load(_saveKey);
@@ -162,6 +255,13 @@ public sealed class SpiritController : MonoBehaviour
                 data.HasWorkZone, data.WorkZone, data.WorkZoneMode, WorkRadius, _config.ShowWorkZone.Value,
                 data.UnloadPoints);
             _markers.RestoreForbidden(data.HasForbiddenZone, data.ForbiddenZone);
+            if (data.Automation.ShrineSet) _markers.SetShrine(SpiritKnowledge.ToVector(data.Automation.ShrinePosition), data.Automation.ShrineLevel);
+            foreach (var order in data.Automation.PendingOrders) _assignments.Enqueue(order);
+            if (data.Automation.CurrentOrder != null)
+            {
+                data.Automation.CurrentOrder.Collected = data.Automation.CurrentOrder.Delivered;
+                ActivateOrder(data.Automation.CurrentOrder);
+            }
             _initialized = true;
         }
         if (_visual != null) return;
@@ -178,19 +278,53 @@ public sealed class SpiritController : MonoBehaviour
 
     private void HandleInput()
     {
-        if (_config.MenuKey.Value.IsDown()) { _ui.ToggleMenu(); _audio?.Play(SpiritAudioEvent.MenuOpen); }
-        if (!_ui.MenuOpen && Input.GetMouseButtonDown(2)) InspectLookTarget(true);
+        if (_config.MenuKey.Value.IsDown())
+        {
+            if (!_ui.MenuOpen)
+            {
+                _resources.RefreshItemCatalog();
+                _ui.SetResources(_resources.ItemChoices);
+            }
+            _ui.ToggleMenu();
+            _audio?.Play(SpiritAudioEvent.MenuOpen);
+        }
     }
 
     private void TickAi(Player player, float deltaTime)
     {
         if (_visual == null) return;
-        _carry.TickClaims(EffectiveCarryStacks, EffectiveCarryWeight);
-        TrackRecentDrops();
+        _visual.SetForbiddenArea(_markers.HasForbiddenZone ? _markers.ForbiddenZoneCentre : (Vector3?)null, 10f);
+        _markers.UpdateNavigationTrail(_visual.Transform.position, _job == SpiritJob.Guide);
+        _markers.UpdateShrine(_progression.Data.Automation.ShrineSet && (_state is SpiritState.Rest or SpiritState.Recharge) &&
+            Vector3.Distance(_visual.Transform.position, SpiritKnowledge.ToVector(_progression.Data.Automation.ShrinePosition)) < 4f,
+            _visual.Transform.position);
         _markers.Tick(player, WorkRadius, _config.ShowWorkZone.Value);
         TrackFlight();
         TickLongTermProgress(player, deltaTime);
+        if (player.IsDead())
+        {
+            _visual.ShowEmotion(SpiritEmotion.Mourning);
+            _visual.Tick(SpiritState.Rest, EnergyRatio, deltaTime, _progression.Level, DominantProfession(), _progression.Data.Bond);
+            return;
+        }
+        _carry.TickClaims(EffectiveCarryStacks, EffectiveCarryWeight);
+        TrackRecentDrops();
+        if (_progression.Data.Automation.Stability < 10f && _job is not SpiritJob.Rest and not SpiritJob.Stopped &&
+            CountEnemies(player.transform.position, 18f) > 0)
+        {
+            Follow(player, deltaTime);
+            _carry.Follow(_visual.Transform.position);
+            _visual.Tick(_state, EnergyRatio, deltaTime, _progression.Level, DominantProfession(), _progression.Data.Bond);
+            return;
+        }
         TickAutomationRules(player);
+        if (Time.time < _baseAlarmReturnUntil)
+        {
+            Follow(player, deltaTime);
+            _carry.Follow(_visual.Transform.position);
+            _visual.Tick(SpiritState.Guard, EnergyRatio, deltaTime, _progression.Level, DominantProfession(), _progression.Data.Bond);
+            return;
+        }
         if (player.IsSleeping())
         {
             SetState(SpiritState.Rest);
@@ -198,15 +332,24 @@ public sealed class SpiritController : MonoBehaviour
             _visual.Tick(_state, EnergyRatio, deltaTime, _progression.Level, DominantProfession(), _progression.Data.Bond);
             return;
         }
+        TickBuildAssist(player);
         RemoveExpiredBlacklistEntries();
-        if (Time.time < _celebrateUntil) { Celebrate(player, deltaTime); _visual.Tick(_state, EnergyRatio, deltaTime, _progression.Level, DominantProfession(), _progression.Data.Bond); return; }
+        if (Time.time < _celebrateUntil) { Celebrate(player, deltaTime); _carry.Follow(_visual.Transform.position); _visual.Tick(_state, EnergyRatio, deltaTime, _progression.Level, DominantProfession(), _progression.Data.Bond); return; }
         if (_job == SpiritJob.Stopped) { SetState(SpiritState.Idle); _visual.Tick(_state, EnergyRatio, deltaTime, _progression.Level, DominantProfession(), _progression.Data.Bond); return; }
         if (_progression.Data.Energy <= 0f && _config.EnergyEnabled.Value && _job != SpiritJob.Rest)
         {
             _jobBeforeRest = _job;
+            _resumeAfterRest = true;
             _job = SpiritJob.Rest;
             SetState(SpiritState.Rest);
             _audio?.Play(SpiritAudioEvent.EnergyEmpty);
+        }
+        if (_finishingOrder && _job != SpiritJob.Rest)
+        {
+            FinishOrder(player, deltaTime);
+            RecoverBlockedNavigation();
+            _carry.Follow(_visual.Transform.position);
+            return;
         }
         switch (_job)
         {
@@ -229,6 +372,7 @@ public sealed class SpiritController : MonoBehaviour
             case SpiritJob.Production: Production(player, deltaTime); break;
             default: WorkJob(player, deltaTime); break;
         }
+        RecoverBlockedNavigation();
         _carry.Follow(_visual.Transform.position);
         _visual.Tick(_state, EnergyRatio, deltaTime, _progression.Level, DominantProfession(), _progression.Data.Bond);
     }
@@ -239,21 +383,30 @@ public sealed class SpiritController : MonoBehaviour
         var movementLead = player.GetVelocity();
         movementLead.y = 0f;
         movementLead = Vector3.ClampMagnitude(movementLead * 0.55f, 5f);
-        var side = player.transform.right * _config.FollowDistance.Value + player.transform.forward * -0.7f + movementLead;
+        var exploring = player.GetCurrentBiome() == Heightmap.Biome.Mistlands;
+        var side = player.transform.right * _config.FollowDistance.Value + player.transform.forward * (exploring ? 5f : -0.7f) + movementLead;
+        if (_ui.MenuOpen) side *= 0.5f;
         var bob = Vector3.up * (_config.FollowHeight.Value + Mathf.Sin(Time.time * 1.8f) * _config.BobbingAmount.Value);
         if (_progression.Data.Personality == "Любопытный")
             side += new Vector3(Mathf.Cos(Time.time * 0.7f), 0f, Mathf.Sin(Time.time * 0.7f)) * 0.45f;
-        _visual!.Move(player.transform.position + side + bob, _config.FollowSpeed.Value * ActiveSpeedMultiplier, deltaTime);
+        var destination = _followCloseToPlayer
+            ? player.transform.position + Vector3.up * 1.1f
+            : player.transform.position + side + bob;
+        _visual!.Move(destination, _config.FollowSpeed.Value * ActiveSpeedMultiplier, deltaTime);
     }
 
     private void Rest(Player player, float deltaTime)
     {
         SetState(SpiritState.Rest);
         var automation = _progression.Data.Automation;
-        var restPoint = automation.ShrineSet ? SpiritKnowledge.ToVector(automation.ShrinePosition) : player.transform.position;
+        var shrinePoint = SpiritKnowledge.ToVector(automation.ShrinePosition);
+        var restPoint = !_restNearPlayer && automation.ShrineSet && Vector3.Distance(player.transform.position, shrinePoint) < _config.MaxDistanceFromPlayer.Value
+            ? shrinePoint : player.transform.position;
         _visual!.Move(restPoint + Vector3.up * 1.1f, 5f * ActiveSpeedMultiplier, deltaTime);
-        if (_progression.Data.Energy >= 99.9f)
+        _visual.ShowEmotion(SpiritEmotion.Resting);
+        if (_resumeAfterRest && _progression.Data.Energy >= 99.9f)
         {
+            _resumeAfterRest = false;
             _job = _jobBeforeRest == SpiritJob.Rest || _jobBeforeRest == SpiritJob.Stopped ? SpiritJob.Follow : _jobBeforeRest;
             _ui.Notify($"Энергия восстановлена. Возобновлена задача: {SpiritUI.JobName(_job)}.");
             _audio?.Play(SpiritAudioEvent.EnergyRestored);
@@ -277,7 +430,9 @@ public sealed class SpiritController : MonoBehaviour
                 if (Time.time >= _nextScan)
                 {
                     _nextScan = Time.time + 0.35f;
-                    _target = _scanner.FindTreeLog(_completedTargetPosition, 25f);
+                    _target = _scanner.FindTreeLog(_completedTargetPosition, 25f, _resourceSelection,
+                        _config.SafeBaseRadius.Value, _config.ProtectPlantedTrees.Value, _progression,
+                        ActiveBlacklist(), IsWorkPositionForbidden);
                     if (_target != null)
                     {
                         _awaitingTreeLog = false;
@@ -294,7 +449,7 @@ public sealed class SpiritController : MonoBehaviour
         if (_target == null && Time.time < _collectDropsUntil)
         {
             SetState(SpiritState.WaitForDrop);
-            if (_config.AutoCarry.Value) _carry.TryCollect(_completedTargetPosition, EffectiveCarryStacks,
+            if (_config.AutoCarry.Value || _assignmentQuantity > 0) _carry.TryCollect(_completedTargetPosition, EffectiveCarryStacks,
                 EffectiveCarryWeight, _resourceSelection, IsResourceForCurrentJob);
             if (_carry.Count == 0) FollowNearWorkCentre(player, deltaTime);
             return;
@@ -313,31 +468,42 @@ public sealed class SpiritController : MonoBehaviour
             SetState(SpiritState.SearchTarget); _nextScan = Time.time + _config.SearchInterval.Value * personalitySearch * (1f - biomeKnowledge * 0.003f);
             var centre = _markers.GetWorkCentre(player);
             _target = _scanner.Find(centre, EffectiveSearchRadius, activeWorkJob, _resourceSelection, _config.SafeBaseRadius.Value,
-                _config.ProtectPlantedTrees.Value, _config.ProtectCrops.Value, _progression, ActiveBlacklist(), _markers.IsForbidden,
-                _markers.HasUnloadPoint ? _markers.UnloadPoint : (Vector3?)null);
+                _config.ProtectPlantedTrees.Value, _config.ProtectCrops.Value, _progression, ActiveBlacklist(), IsWorkPositionForbidden,
+                _markers.HasUnloadPoint ? _markers.UnloadPoint : (Vector3?)null, cleanupOnly: _job == SpiritJob.Cleanup);
+            if (_target == null && _job == SpiritJob.Cleanup && _resourceSelection.Mode == ResourceFilterMode.All)
+            {
+                _target = _scanner.Find(centre, EffectiveSearchRadius, SpiritJob.Mining, _resourceSelection, _config.SafeBaseRadius.Value,
+                    true, true, _progression, ActiveBlacklist(), IsWorkPositionForbidden, cleanupOnly: true);
+                if (_target != null) { _assistWorkJob = SpiritJob.Mining; activeWorkJob = SpiritJob.Mining; }
+            }
             if (_target == null)
             {
+                _lastError = _scanner.LastSearchFailure;
                 if (_carry.Count > 0) DeliverCarried(player, deltaTime);
-                else { FollowNearWorkCentre(player, deltaTime); SuggestNextWork(player); }
+                else { FollowNearWorkCentre(player, deltaTime); SuggestNextWork(); }
                 return;
             }
+            _lastError = string.Empty;
             _targetStarted = Time.time; _workAttempts = 0; _lastTargetPosition = _target.Position.ToString("F0");
             _targetWasStandingTree = _target.Component is TreeBase;
-            _ui.Notify($"Дух нашёл: {_target.Definition.Name}.", 2f);
+            _ui.Notify($"Дух нашёл: {ResourceName(_target.Definition.Name)}.", 2f);
         }
-        if (Vector3.Distance(_target.Position, _markers.GetWorkCentre(player)) > WorkRadius)
+        if (Vector3.Distance(_target.Position, _markers.GetWorkCentre(player)) > EffectiveSearchRadius)
         {
             CancelTarget("Цель находится вне рабочей зоны."); return;
         }
-        if (Vector3.Distance(player.transform.position, _target.Position) > _config.MaxDistanceFromPlayer.Value)
+        var maximumDistance = _config.MaxDistanceFromPlayer.Value *
+            (_progression.Data.Automation.ShrineSet && _progression.Data.Automation.ShrineLevel >= 3 ? 1.25f : 1f);
+        if (Vector3.Distance(player.transform.position, _target.Position) > maximumDistance)
         {
             CancelTarget("Дух слишком далеко от игрока."); return;
         }
         SetState(SpiritState.MoveToTarget);
         var destination = _target.Position + Vector3.up * 1.8f;
         _visual!.Move(destination, _config.BalanceMode.Value == BalanceMode.Free ? 18f : 10f, deltaTime);
-        if (Vector3.Distance(_visual.Transform.position, destination) > 2.2f || Time.time < _nextWork) return;
+        if (Vector3.Distance(_visual.Transform.position, destination) > 2.2f) return;
         SetState(SpiritState.Work);
+        if (Time.time < _nextWork) return;
         var workInterval = Mathf.Max(0.2f, _target.Definition.WorkInterval * Mathf.Clamp(_config.WorkInterval.Value / 1.5f, 0.25f, 4f));
         var talentBranch = activeWorkJob == SpiritJob.Woodcutting ? "woodcutting" : activeWorkJob == SpiritJob.Mining ? "mining" : string.Empty;
         if (talentBranch.Length > 0) workInterval *= 1f - TalentTier(talentBranch) * 0.08f;
@@ -350,19 +516,21 @@ public sealed class SpiritController : MonoBehaviour
             CancelTarget(error); return;
         }
         _workAttempts++;
+        TargetScorer.MarkWorked(_target);
         _completedTargetPosition = _target.Position;
         _lastWorkPosition = _target.HitPoint;
         _dropTrackingUntil = Time.time + 4f;
         SpendEnergy(_target.Definition.EnergyCost);
         _audio?.Play(activeWorkJob == SpiritJob.Woodcutting ? SpiritAudioEvent.WoodHit : activeWorkJob == SpiritJob.Mining ? SpiritAudioEvent.MiningHitOre : SpiritAudioEvent.GatherPlant, 0.35f);
-        if (_target.Definition.DamageType == ResourceDamageType.Interact) CompleteTarget();
+        // Interaction is an asynchronous vanilla RPC. Completion requires observing the picked state.
     }
 
     private void CompleteTarget()
     {
         if (_target == null) return;
-        _targetFailures.Remove(_target.Component.GetInstanceID());
+        if (_target.Component) _targetFailures.Remove(_target.Component.GetInstanceID());
         var definition = _target.Definition;
+        _knowledge.MarkDepleted(_completedTargetPosition);
         if (_target.IsValid) _completedTargetPosition = _target.Position;
         if (_targetWasStandingTree)
         {
@@ -374,7 +542,6 @@ public sealed class SpiritController : MonoBehaviour
         {
             Award(definition.XpReward, definition.ProfessionXpReward, definition.Profession);
             RecordWork(definition);
-            CountAssignmentProgress();
             _collectDropsUntil = Time.time + 4f;
         }
         _target = null; _workAttempts = 0;
@@ -404,15 +571,16 @@ public sealed class SpiritController : MonoBehaviour
         var typedUnloadPoint = default(Vector3);
         var useUnloadPoint = cargoDefinition != null &&
             _markers.TryFindUnload(cargoDefinition, _resourceSelection, _visual!.Transform.position, out typedUnloadPoint);
-        var deliveryPoint = useUnloadPoint ? typedUnloadPoint : player.transform.position + player.transform.forward * 1.5f;
+        var deliveryPoint = _orderDeliveryPoint ?? (useUnloadPoint ? typedUnloadPoint : player.transform.position + player.transform.forward * 1.5f);
+        if (_orderDeliveryPoint.HasValue) useUnloadPoint = true;
         Func<ResourceDefinition, bool> accepts = useUnloadPoint
-            ? definition => _markers.TryFindUnload(definition, _resourceSelection, _visual!.Transform.position, out var candidate) &&
+            ? definition => _orderDeliveryPoint.HasValue || _markers.TryFindUnload(definition, _resourceSelection, _visual!.Transform.position, out var candidate) &&
                             Vector3.SqrMagnitude(candidate - deliveryPoint) < 0.25f
             : _ => true;
         SetState(SpiritState.CarryDrops);
-        _visual!.Move(deliveryPoint + Vector3.up * 1.7f, 8f, deltaTime);
+        _visual!.Move(deliveryPoint + Vector3.up * 1.7f, 8f * (1f + TalentTier("logistics") * 0.08f), deltaTime);
         if (Vector3.Distance(_visual.Transform.position, deliveryPoint) >= 2f) return;
-        var container = useUnloadPoint ? FindContainer(deliveryPoint) : null;
+        var container = useUnloadPoint ? _markers.ResolveContainer(deliveryPoint) : null;
         var delivered = 0;
         var usedContainer = false;
         if (container)
@@ -431,99 +599,15 @@ public sealed class SpiritController : MonoBehaviour
         _progression.Data.Automation.LongestTrip = Mathf.Max(_progression.Data.Automation.LongestTrip,
             Vector3.Distance(_lastWorkPosition, deliveryPoint));
         _containerUnloadStarted = 0f;
-        _progression.Data.ItemsDelivered += delivered;
         _progression.Data.Bond += delivered * 0.05f;
         Award(_config.LogisticsXp.Value, _config.LogisticsXp.Value, Profession.Logistics);
         _forceDelivery = _carry.IsFull(EffectiveCarryStacks, EffectiveCarryWeight);
         _audio?.Play(SpiritAudioEvent.Unload);
+        _visual.ShowEmotion(SpiritEmotion.Happy, 1.5f);
         _ui.Notify(usedContainer
             ? $"Дух сложил груз в сундук: {delivered}."
             : useUnloadPoint ? $"Дух доставил груз к точке разгрузки: {delivered}." : $"Дух принёс груз к игроку: {delivered}.", 2f);
         SetState(SpiritState.Unload);
-    }
-
-    private void Scout(Player player, float deltaTime)
-    {
-        SetState(SpiritState.Scout);
-        var point = player.transform.position + player.transform.forward * 22f + Vector3.up * 8f;
-        _visual!.Move(point, 13f, deltaTime); SpendEnergy(0.3f * deltaTime);
-        if (Time.time < _nextScoutReport) return;
-        _nextScoutReport = Time.time + 6f;
-        var radius = Mathf.Min((45f + TalentTier("exploration") * 10f + _knowledge.BiomeKnowledge(player.GetCurrentBiome()) * 0.2f) * _shrineScoutMultiplier, EffectiveSearchRadius);
-        var report = _scanner.Survey(point, radius, _resourceSelection, _progression);
-        var knownBefore = _progression.Data.Automation.WorldMemory.Count;
-        _knowledge.RememberSurvey(report, CurrentDay());
-        if (report.Count == 0) { _ui.Notify("Разведка: подходящих ресурсов не найдено.", 3f); return; }
-        var lines = new List<string>();
-        TargetScanner.SurveyEntry? nearest = null;
-        string? nearestName = null;
-        foreach (var entry in report)
-        {
-            lines.Add($"{ResourceName(entry.Key)}: {entry.Value.Count}");
-            if (nearest == null || entry.Value.NearestDistance < nearest.NearestDistance)
-            {
-                nearest = entry.Value;
-                nearestName = entry.Key;
-            }
-        }
-        if (nearest != null)
-        {
-            _markers.ShowTemporaryMarker(nearest.NearestPosition, new Color(0.35f, 0.9f, 1f));
-            lines.Add($"Ближайшее: {ResourceName(nearestName ?? string.Empty)}, {Vector3.Distance(player.transform.position, nearest.NearestPosition):0} м");
-        }
-        _ui.Notify("Разведка завершена\n" + string.Join(" • ", lines), 6f);
-        if (_progression.Data.Automation.WorldMemory.Count > knownBefore)
-            AddJournal($"Разведка открыла новые места: {_progression.Data.Automation.WorldMemory.Count - knownBefore}.");
-    }
-
-    private void Guard(Player player, float deltaTime)
-    {
-        SetState(SpiritState.Guard);
-        var nearestDistance = _guardThreat && !_guardThreat.IsDead()
-            ? Vector3.SqrMagnitude(_guardThreat.transform.position - player.transform.position)
-            : 25f * 25f;
-        if (Time.time >= _nextGuardScan)
-        {
-            _nextGuardScan = Time.time + 0.75f;
-            _guardThreat = null;
-            nearestDistance = 25f * 25f;
-            foreach (var character in Character.GetAllCharacters())
-            {
-                if (!character || character == player || character.IsDead() || !BaseAI.IsEnemy(player, character)) continue;
-                var distance = Vector3.SqrMagnitude(character.transform.position - player.transform.position);
-                if (distance >= nearestDistance) continue;
-                nearestDistance = distance;
-                _guardThreat = character;
-            }
-        }
-        var point = _guardThreat
-            ? Vector3.Lerp(player.transform.position, _guardThreat.transform.position, 0.55f) + Vector3.up * 2.5f
-            : player.transform.position + new Vector3(Mathf.Cos(Time.time), 0.85f, Mathf.Sin(Time.time)) * 3f + Vector3.up * 1.7f;
-        _visual!.Move(point, 8f, deltaTime);
-        if (_guardThreat && Time.time >= _nextGuardNotice)
-        {
-            _nextGuardNotice = Time.time + 5f;
-            var critical = player.GetHealthPercentage() < 0.3f;
-            _ui.Notify(critical
-                ? $"Опасность: мало здоровья, враг в {Mathf.Sqrt(nearestDistance):0} м!"
-                : $"Дозор: враг в {Mathf.Sqrt(nearestDistance):0} м!", 3f);
-            _audio?.Play(SpiritAudioEvent.DangerDetected);
-        }
-    }
-
-    private void Observe(Player player, float deltaTime)
-    {
-        SetState(SpiritState.Observe);
-        Follow(player, deltaTime);
-        if (Time.time < _nextObservation || !Input.GetMouseButton(0) && !Input.GetKey(KeyCode.E)) return;
-        _nextObservation = Time.time + 0.6f;
-        var definition = LookResource();
-        if (definition == null || definition == _observedResource) return;
-        _observedResource = definition;
-        _knowledge.Remember(definition.Name, player.transform.position, CurrentDay());
-        _knowledge.RecordDecision($"Learned player action: {definition.Name}");
-        _ui.Notify($"✦ Дух понял действие с {ResourceName(definition.Name)}. Контекстная команда повторит его рядом.", 5f);
-        _audio?.Play(SpiritAudioEvent.TargetFound);
     }
 
     private void Assist(Player player, float deltaTime)
@@ -547,7 +631,9 @@ public sealed class SpiritController : MonoBehaviour
     private void Cleanup(Player player, float deltaTime)
     {
         SetState(SpiritState.CollectDrops);
-        var centre = player.transform.position - player.transform.forward * 2f;
+        var centre = _markers.GetWorkCentre(player);
+        if (_carry.Count > 0 && _carry.IsFull(EffectiveCarryStacks, EffectiveCarryWeight))
+        { DeliverCarried(player, deltaTime); return; }
         var nearest = _carry.FindNearest(centre, Mathf.Min(30f, WorkRadius), _resourceSelection);
         if (nearest.HasValue)
         {
@@ -568,59 +654,6 @@ public sealed class SpiritController : MonoBehaviour
             WorkJob(player, deltaTime);
         }
         if (_carry.IsFull(EffectiveCarryStacks, EffectiveCarryWeight)) DeliverCarried(player, deltaTime);
-    }
-
-    private void Courier(Player player, float deltaTime)
-    {
-        var route = _progression.Data.Automation.CourierRoute;
-        if (!route.Enabled) { Follow(player, deltaTime); return; }
-        var source = SpiritKnowledge.ToVector(route.Source);
-        var destination = SpiritKnowledge.ToVector(route.Destination);
-        if (_carry.Count == 0)
-        {
-            SetState(SpiritState.CollectDrops);
-            _visual!.Move(source + Vector3.up * 1.5f, _config.FollowSpeed.Value, deltaTime);
-            if (Vector3.Distance(_visual.Transform.position, source) <= 3f)
-                _carry.TryCollect(source, EffectiveCarryStacks, EffectiveCarryWeight, _resourceSelection);
-            return;
-        }
-        SetState(SpiritState.CarryDrops);
-        _visual!.Move(destination + Vector3.up * 1.5f, _config.FollowSpeed.Value, deltaTime);
-        if (Vector3.Distance(_visual.Transform.position, destination) <= 2.5f)
-            _carry.Unload(destination, 1.3f, _ => true);
-    }
-
-    private void Caravan(Player player, float deltaTime)
-    {
-        SetState(SpiritState.CarryDrops);
-        Follow(player, deltaTime);
-    }
-
-    private void Bring(Player player, float deltaTime)
-    {
-        if (_carry.Count > 0)
-        {
-            SetState(SpiritState.CarryDrops);
-            var destination = player.transform.position + player.transform.forward * 1.3f;
-            _visual!.Move(destination + Vector3.up * 1.5f, _config.FollowSpeed.Value, deltaTime);
-            if (Vector3.Distance(_visual.Transform.position, destination) <= 2f)
-                _carry.Unload(destination, 1f, _ => true);
-            return;
-        }
-        var nearest = _carry.FindNearest(player.transform.position, WorkRadius, _resourceSelection);
-        if (!nearest.HasValue)
-        {
-            var container = FindNearestContainer(player.transform.position, WorkRadius);
-            if (!container) { Follow(player, deltaTime); return; }
-            _visual!.Move(container.transform.position + Vector3.up * 1.5f, _config.FollowSpeed.Value, deltaTime);
-            if (Vector3.Distance(_visual.Transform.position, container.transform.position) <= 3f)
-                _carry.TryWithdraw(container, container.transform.position + Vector3.up * 1.2f,
-                    EffectiveCarryStacks, EffectiveCarryWeight, _resourceSelection);
-            return;
-        }
-        _visual!.Move(nearest.Value + Vector3.up, _config.FollowSpeed.Value, deltaTime);
-        if (Vector3.Distance(_visual.Transform.position, nearest.Value) <= 3f)
-            _carry.TryCollect(nearest.Value, EffectiveCarryStacks, EffectiveCarryWeight, _resourceSelection);
     }
 
     private void SortCargo(Player player, float deltaTime)
@@ -647,103 +680,44 @@ public sealed class SpiritController : MonoBehaviour
         TickBaseAlarm(player, centre);
     }
 
-    private void Guide(Player player, float deltaTime)
-    {
-        SetState(SpiritState.Guide);
-        if (!_guideDestination.HasValue) { Follow(player, deltaTime); return; }
-        var destination = _guideDestination.Value;
-        var distance = Vector3.Distance(player.transform.position, destination);
-        if (distance <= 4f)
-        {
-            _ui.Notify($"Мы пришли: {_guideLabel}.");
-            _guideDestination = null;
-            SetJob(SpiritJob.Follow);
-            return;
-        }
-        var direction = (destination - player.transform.position).normalized;
-        var lead = player.transform.position + direction * Mathf.Min(9f, distance) + Vector3.up * 2.5f;
-        _visual!.Move(lead, 12f, deltaTime);
-    }
-
-    private void ExploreDungeon(Player player, float deltaTime)
-    {
-        SetState(SpiritState.Scout);
-        var point = player.transform.position + player.transform.forward * 7f + Vector3.up * 2.2f;
-        _visual!.Move(point, 10f, deltaTime);
-        if (Time.time < _nextAdvancedTick) return;
-        _nextAdvancedTick = Time.time + 2f;
-        var drop = _carry.FindNearest(point, 14f, _resourceSelection);
-        if (drop.HasValue) _markers.ShowTemporaryMarker(drop.Value, new Color(0.8f, 0.65f, 1f), 8f);
-        DetectNearbySecret(point, 18f);
-        TickThreatWarning(player, 18f);
-    }
-
-    private void Expedition(Player player, float deltaTime)
-    {
-        SetState(SpiritState.Expedition);
-        if (_expeditionEndsAt <= 0f)
-        {
-            _expeditionEndsAt = Time.time + 45f;
-            _ui.Notify("Дух отправился в разведочную экспедицию.");
-        }
-        var progress = 1f - Mathf.Clamp01((_expeditionEndsAt - Time.time) / 45f);
-        var angle = progress * Mathf.PI * 8f;
-        var point = player.transform.position + new Vector3(Mathf.Cos(angle), 0.4f, Mathf.Sin(angle)) * (20f + progress * WorkRadius) + Vector3.up * 12f;
-        _visual!.Move(point, 18f, deltaTime);
-        if (Time.time < _expeditionEndsAt) return;
-        _expeditionEndsAt = 0f;
-        var report = _scanner.Survey(player.transform.position, WorkRadius, _resourceSelection, _progression);
-        _knowledge.RememberSurvey(report, CurrentDay());
-        _ui.Notify($"Экспедиция завершена: разведано {WorkRadius:0} м, типов ресурсов найдено: {report.Count}.", 7f);
-        AddJournal($"Экспедиция обнаружила {report.Count} типов ресурсов.");
-        SetJob(SpiritJob.Follow);
-    }
-
     private void Production(Player player, float deltaTime)
     {
         SetState(SpiritState.Production);
-        SortCargo(player, deltaTime);
-        if (Time.time >= _nextAdvancedTick)
+        if (_carry.Count > 0) { DeliverCarried(player, deltaTime); return; }
+        var tick = _production.Tick(player, _visual!.Transform.position, _markers.GetWorkCentre(player), WorkRadius);
+        if (tick.Destination.HasValue)
+            _visual.Move(tick.Destination.Value, _config.FollowSpeed.Value * ActiveSpeedMultiplier, deltaTime);
+        else if (!tick.Completed)
         {
-            _nextAdvancedTick = Time.time + 6f;
-            _ui.Notify("Производственная логистика: готовые drops переносятся к специализированным складам.", 3f);
+            var output = _production.FindOutput(_markers.GetWorkCentre(player), WorkRadius, _resourceSelection);
+            if (output.HasValue)
+            {
+                _visual.Move(output.Value + Vector3.up, _config.FollowSpeed.Value, deltaTime);
+                if (Vector3.Distance(_visual.Transform.position, output.Value) < 3f)
+                    _carry.TryCollect(output.Value, EffectiveCarryStacks, EffectiveCarryWeight, _resourceSelection);
+            }
+            else FollowNearWorkCentre(player, deltaTime);
+        }
+        if (tick.Completed)
+        {
+            _ui.Notify(tick.Status, 3f);
+            Award(_config.LogisticsXp.Value, _config.LogisticsXp.Value, Profession.Logistics);
         }
     }
 
-    private void StartBuildAssist()
+    private Container? FindNearestContainer(Vector3 centre, float radius)
     {
-        var player = Player.m_localPlayer;
-        var piece = player ? player.GetSelectedPiece() : null;
-        if (!piece || piece.m_resources == null || piece.m_resources.Length == 0)
-        {
-            _ui.Notify("Возьмите молот и выберите строительную деталь.");
-            return;
-        }
-        foreach (var requirement in piece.m_resources)
-        {
-            if (!requirement.m_resItem) continue;
-            var definition = _resources.ByDrop(requirement.m_resItem.gameObject.name);
-            if (definition == null) continue;
-            _resourceSelection.SelectExact(definition.Name);
-            SetJob(SpiritJob.Bring);
-            _ui.Notify($"Строительный помощник несёт {ResourceName(definition.Name)} для {piece.m_name}.");
-            return;
-        }
-        _ui.Notify("Для выбранной детали нет известного духу материала.");
-    }
-
-    private static Container? FindNearestContainer(Vector3 centre, float radius)
-    {
-        var hits = Physics.OverlapSphere(centre, radius, Physics.AllLayers, QueryTriggerInteraction.Collide);
         Container? nearest = null;
         var nearestDistance = float.MaxValue;
         var seen = new HashSet<int>();
-        foreach (var hit in hits)
+        foreach (var saved in _markers.ExportUnloadPoints())
         {
-            var container = hit ? hit.GetComponentInParent<Container>() : null;
-            if (!container || !seen.Add(container.GetInstanceID())) continue;
+            var container = _markers.ResolveContainer(SpiritKnowledge.ToVector(saved.Position));
+            if (!container || !seen.Add(container.GetInstanceID()) || !CarrySystem.CanAccessContainer(container)) continue;
             var distance = Vector3.SqrMagnitude(container.transform.position - centre);
-            if (distance >= nearestDistance) continue;
+            if (distance >= nearestDistance || distance > radius * radius) continue;
+            if (!container.GetInventory().GetAllItems().Any(item => item.m_dropPrefab &&
+                _resources.ByDrop(item.m_dropPrefab.name) is { } resource && _resourceSelection.Allows(resource))) continue;
             nearest = container;
             nearestDistance = distance;
         }
@@ -768,24 +742,42 @@ public sealed class SpiritController : MonoBehaviour
         }
         if (_queueMode && job is SpiritJob.Woodcutting or SpiritJob.Mining or SpiritJob.Gathering)
         {
-            _assignments.Enqueue(new SpiritAssignment(job, _selectedQuantity));
+            _assignments.Enqueue(CaptureOrder(job));
             _ui.Notify($"Добавлено в очередь: {SpiritUI.JobName(job)}, {QuantityName(_selectedQuantity)}.");
+            if (_job is SpiritJob.Follow or SpiritJob.Stopped or SpiritJob.Rest) ActivateOrder(_assignments.Dequeue());
             return;
         }
-        _job = job; _assignmentQuantity = _selectedQuantity; _assignmentProgress = 0;
+        if (_job == SpiritJob.Production && _visual != null) _production.Cancel(_visual.Transform.position);
+        if (_job == SpiritJob.Caravan || job == SpiritJob.Stopped) _carry.Release();
+        _resumeAfterRest = false;
+        _resumeAfterThreat = false;
+        _lastError = string.Empty;
+        _finishingOrder = false;
+        ActivateOrder(CaptureOrder(job));
         _containerUnloadStarted = 0f;
         _target = null; _workAttempts = 0; _awaitingTreeLog = false;
+        _collectDropsUntil = 0f;
+        _dropTrackingUntil = 0f;
         _ui.Notify($"Задача духа: {SpiritUI.JobName(job)}.");
     }
 
     private void HandleMenuAction(SpiritMenuAction action)
     {
+        var requiredLevel = MenuRequiredLevel(action);
+        if (_progression.Level < requiredLevel)
+        { _ui.Notify($"Эта возможность откроется на уровне {requiredLevel}."); return; }
+        if (action is SpiritMenuAction.FilterAll or SpiritMenuAction.FilterWood or SpiritMenuAction.FilterStone or
+            SpiritMenuAction.FilterOre or SpiritMenuAction.FilterPlants or SpiritMenuAction.FilterFood)
+            PrepareMenuFilterChange();
+        if (action is SpiritMenuAction.Follow or SpiritMenuAction.Stop or SpiritMenuAction.Rest or SpiritMenuAction.Woodcutting or
+            SpiritMenuAction.Mining or SpiritMenuAction.Gathering or SpiritMenuAction.Transport or SpiritMenuAction.Scout or SpiritMenuAction.Guard)
+            _buildAssistEnabled = false;
         switch (action)
         {
             case SpiritMenuAction.Follow: SetJob(SpiritJob.Follow); break;
-            case SpiritMenuAction.Woodcutting: SetJob(SpiritJob.Woodcutting); break;
-            case SpiritMenuAction.Mining: SetJob(SpiritJob.Mining); break;
-            case SpiritMenuAction.Gathering: SetJob(SpiritJob.Gathering); break;
+            case SpiritMenuAction.Woodcutting: StartHarvestCommand(SpiritJob.Woodcutting); break;
+            case SpiritMenuAction.Mining: StartHarvestCommand(SpiritJob.Mining); break;
+            case SpiritMenuAction.Gathering: StartHarvestCommand(SpiritJob.Gathering); break;
             case SpiritMenuAction.Transport: SetJob(SpiritJob.Transport); break;
             case SpiritMenuAction.Scout: SetJob(SpiritJob.Scout); break;
             case SpiritMenuAction.Guard: SetJob(SpiritJob.Guard); break;
@@ -795,7 +787,7 @@ public sealed class SpiritController : MonoBehaviour
             case SpiritMenuAction.RemoveUnload:
                 _markers.RemoveUnload(); _ui.Notify("Точка разгрузки удалена."); _audio?.Play(SpiritAudioEvent.UnloadPointRemoved); break;
             case SpiritMenuAction.CycleUnloadType:
-                _markers.CycleUnloadType(); _ui.Notify($"Тип разгрузки: {UnloadTypeName(_markers.UnloadType)}."); _audio?.Play(SpiritAudioEvent.MenuSelect); break;
+                _markers.CycleUnloadType(_resourceSelection.ExactName); _ui.Notify($"Тип разгрузки: {UnloadTypeName(_markers.UnloadType)}."); _audio?.Play(SpiritAudioEvent.MenuSelect); break;
             case SpiritMenuAction.CycleZoneMode:
                 _markers.CycleZoneMode(); _ui.Notify($"Режим рабочей зоны: {ZoneModeName(_markers.ZoneMode)}."); break;
             case SpiritMenuAction.PlaceWorkZone: PlaceWorkZone(); break;
@@ -869,6 +861,10 @@ public sealed class SpiritController : MonoBehaviour
             case SpiritMenuAction.ExplainIdle: ExplainIdle(); break;
             case SpiritMenuAction.InspectTarget: InspectLookTarget(false); break;
             case SpiritMenuAction.ContextCommand: InspectLookTarget(true); break;
+            case SpiritMenuAction.WorkAtPing:
+                if (SpiritInputBridge.LastRemotePing is { } ping) HandleSpiritPing(ping.Position, true);
+                else _ui.Notify("Нет метки другого игрока. Попросите его отметить место обычным ping.");
+                break;
             case SpiritMenuAction.Observe: SetJob(SpiritJob.Observe); break;
             case SpiritMenuAction.Assist: SetJob(SpiritJob.Assist); break;
             case SpiritMenuAction.Cleanup: SetJob(SpiritJob.Cleanup); break;
@@ -891,6 +887,7 @@ public sealed class SpiritController : MonoBehaviour
             case SpiritMenuAction.ExploreDungeon: SetJob(SpiritJob.ExploreDungeon); break;
             case SpiritMenuAction.Expedition: SetJob(SpiritJob.Expedition); break;
             case SpiritMenuAction.PlaceShrine: PlaceShrine(); break;
+            case SpiritMenuAction.RemoveShrine: RemoveShrine(); break;
             case SpiritMenuAction.UpgradeShrine: UpgradeShrine(); break;
             case SpiritMenuAction.ChargeShrine: GuideToShrine(); break;
             case SpiritMenuAction.FeedShrine: FeedShrine(); break;
@@ -946,33 +943,6 @@ public sealed class SpiritController : MonoBehaviour
 
     private static string QuantityName(int quantity) => quantity == 0 ? "без ограничения" : quantity.ToString();
 
-    private void CountAssignmentProgress()
-    {
-        if (_assignmentQuantity <= 0) return;
-        _assignmentProgress++;
-        if (_assignmentProgress < _assignmentQuantity) return;
-        _ui.Notify($"Поручение выполнено: {SpiritUI.JobName(_job)} {_assignmentProgress}/{_assignmentQuantity}.");
-        _audio?.Play(SpiritAudioEvent.JobComplete);
-        _celebrateUntil = Time.time + 2.2f;
-        if (_progression.Data.Automation.RepeatOrders)
-        {
-            _assignmentProgress = 0;
-            _ui.Notify("Повторяющееся поручение запущено заново.");
-            return;
-        }
-        if (_assignments.Count == 0)
-        {
-            _job = SpiritJob.Follow;
-            _assignmentQuantity = 0;
-            _assignmentProgress = 0;
-            return;
-        }
-        var next = _assignments.Dequeue();
-        _job = next.Job;
-        _assignmentQuantity = next.Quantity;
-        _assignmentProgress = 0;
-    }
-
     private void SetFilterAll()
     {
         _resourceSelection.AllowAll(); ResetTargetAndClaims(); _ui.Notify("Фильтр: все подходящие ресурсы.");
@@ -985,7 +955,12 @@ public sealed class SpiritController : MonoBehaviour
 
     private void SetExactFilter(string resourceName, string displayName)
     {
-        _resourceSelection.SelectExact(resourceName); ResetTargetAndClaims(); _ui.Notify($"Искать и добывать: {displayName}.");
+        _resourceSelection.SelectExact(resourceName);
+        ResetTargetAndClaims();
+        var definition = _resources.BySelection(resourceName);
+        _ui.Notify(definition is { CanAutoHarvest: false }
+            ? $"Выбрано: {displayName}. Доступна переноска готовых предметов."
+            : $"Выбрано: {displayName}. Запусти рубку, добычу или сбор во вкладке «Работа».");
     }
 
     private void RecallSpirit()
@@ -1023,13 +998,15 @@ public sealed class SpiritController : MonoBehaviour
     {
         var next = _config.WorkRadius.Value < 25f ? 25f : _config.WorkRadius.Value < 50f ? 50f : _config.WorkRadius.Value < 75f ? 75f : _config.WorkRadius.Value < 100f ? 100f : 25f;
         _config.WorkRadius.Value = Mathf.Min(next, _config.MaxWorkRadius.Value);
-        if (_markers.HasWorkZone) _markers.SetWorkZone(_markers.WorkZoneCentre, WorkRadius);
+        if (_markers.HasWorkZone) _markers.SetWorkZone(_markers.WorkZoneCentre, WorkRadius, _config.ShowWorkZone.Value);
         _ui.Notify($"Радиус работы: {WorkRadius:0} м.");
     }
 
     private static string OnOff(bool value) => value ? "включён" : "выключен";
     private static string BalanceName(BalanceMode mode) => mode switch { BalanceMode.Vanilla => "Ванильный", BalanceMode.Balanced => "Сбалансированный", _ => "Свободный" };
-    private static string ResourceName(string name) => name switch
+    private string ResourceName(string name) => name.StartsWith(ResourceDatabase.ItemSelectionPrefix, StringComparison.OrdinalIgnoreCase)
+        ? _resources.BySelection(name)?.DisplayName ?? name.Substring(ResourceDatabase.ItemSelectionPrefix.Length)
+        : name switch
     {
         "Wood" => "Древесина", "Stone" => "Камень", "Copper" => "Медь", "Tin" => "Олово",
         "Silver" => "Серебро", "Obsidian" => "Обсидиан", "Black Marble" => "Чёрный мрамор",
@@ -1039,6 +1016,10 @@ public sealed class SpiritController : MonoBehaviour
     private void PlaceUnloadPoint()
     {
         var player = Player.m_localPlayer;
+        var camera = Camera.main;
+        if (camera && Physics.Raycast(camera.transform.position, camera.transform.forward, out var chestHit, 40f,
+                Physics.AllLayers, QueryTriggerInteraction.Ignore) && chestHit.collider.GetComponentInParent<Container>() is { } chest)
+        { AssignContainer(chest); return; }
         if (!player || !TryPlacementPoint(player, out var point)) { _ui.Notify("Не удалось определить поверхность для точки."); return; }
         if (_progression.Level < 7) { _ui.Notify("Точки разгрузки открываются на уровне 7."); return; }
         var maximumPoints = _progression.Level >= 25 ? 6 : _progression.Level >= 15 ? 3 : 1;
@@ -1079,23 +1060,25 @@ public sealed class SpiritController : MonoBehaviour
         component ??= hit.collider.GetComponentInParent<MineRock>();
         if (!component) { _ui.Notify("Этот объект нельзя добавить в список игнорирования."); return; }
         _targetBlacklist[component.GetInstanceID()] = float.PositiveInfinity;
+        _progression.Data.Automation.IgnoredTargets.Add(new IgnoredTargetData
+            { Prefab = component.gameObject.name, Position = ToArray(component.transform.position) });
         if (_target?.Component == component) _target = null;
-        _ui.Notify("Объект добавлен в список игнорирования до выхода из мира.");
+        _ui.Notify("Объект сохранён в списке игнорирования.");
     }
 
     private void ShowStatistics()
     {
         var data = _progression.Data;
-        _ui.Notify($"Статистика {data.SpiritName}\nДерево: {data.TreesWorked} • Руда/камень: {data.OreWorked} • Растения: {data.PlantsGathered}\nДоставлено: {data.ItemsDelivered} • Полёт: {data.DistanceFlown / 1000f:0.0} км • Связь: {data.Bond:0}", 9f);
-        _ui.Notify($"Любимый ресурс: {_knowledge.FavoriteResource} • Спасено предметов: {data.Automation.ItemsRescued} • Дальний маршрут: {data.Automation.LongestTrip:0} м • Вместе: {data.Automation.TimeTogetherSeconds / 3600d:0.0} ч • Prestige: {data.Automation.PrestigeCount}", 9f);
+        _ui.ShowReport($"Статистика {data.SpiritName}",
+            $"Дерево: {data.TreesWorked} • Руда/камень: {data.OreWorked} • Растения: {data.PlantsGathered}\nДоставлено: {data.ItemsDelivered} • Полёт: {data.DistanceFlown / 1000f:0.0} км • Связь: {data.Bond:0}\n" +
+            $"Любимый ресурс: {_knowledge.FavoriteResource}\nСпасено предметов: {data.Automation.ItemsRescued}\nДальний маршрут: {data.Automation.LongestTrip:0} м\nВместе: {data.Automation.TimeTogetherSeconds / 3600d:0.0} ч\nПерерождений: {data.Automation.PrestigeCount}");
     }
 
     private void ShowJournal()
     {
         var journal = _progression.Data.Journal;
         if (journal.Count == 0) { _ui.Notify("Журнал духа пока пуст."); return; }
-        var start = Math.Max(0, journal.Count - 4);
-        _ui.Notify("Журнал духа\n" + string.Join("\n", journal.GetRange(start, journal.Count - start)), 10f);
+        _ui.ShowReport("Журнал духа", string.Join("\n", journal));
     }
 
     private void ShowDecisions()
@@ -1103,20 +1086,22 @@ public sealed class SpiritController : MonoBehaviour
         var decisions = _progression.Data.Automation.DecisionHistory;
         if (decisions.Count == 0) { _ui.Notify("История решений пока пуста."); return; }
         var lines = new List<string>();
-        for (var index = Math.Max(0, decisions.Count - 8); index < decisions.Count; index++)
+        for (var index = 0; index < decisions.Count; index++)
             lines.Add($"{decisions[index].Time} {decisions[index].Message}");
-        _ui.Notify("Последние решения\n" + string.Join("\n", lines), 12f);
+        _ui.ShowReport("Последние решения", string.Join("\n", lines));
     }
 
     private void ExplainIdle()
     {
-        var reason = _lastError;
+        var reason = string.IsNullOrEmpty(_carry.LastFailure) ? _lastError : _carry.LastFailure;
         if (string.IsNullOrWhiteSpace(reason))
             reason = _target != null ? $"Выполняю: {_target.Definition.Name}." :
                 _carry.Count > 0 && !_markers.HasUnloadPoint ? "Груз есть, но точка разгрузки не назначена." :
                 _state == SpiritState.SearchTarget ? $"Подходящих целей нет в радиусе {WorkRadius:0} м." :
                 $"Текущее состояние: {SpiritUI.JobName(_job)} / {_state}.";
-        _ui.Notify("Почему дух ждёт:\n" + reason, 7f);
+        var known = _knowledge.FindNearest(_resourceSelection.ExactName, Player.m_localPlayer.transform.position);
+        if (known != null) reason += $"\nБлижайшее известное место: {ResourceName(known.Resource)}, {Vector3.Distance(Player.m_localPlayer.transform.position, SpiritKnowledge.ToVector(known.Position)):0} м.";
+        _ui.ShowReport("Почему дух ждёт", reason);
     }
 
     private void InspectLookTarget(bool executeContextCommand)
@@ -1126,6 +1111,7 @@ public sealed class SpiritController : MonoBehaviour
         if (!camera || !player || !Physics.Raycast(camera.transform.position, camera.transform.forward, out var hit, 40f,
                 Physics.AllLayers, QueryTriggerInteraction.Ignore))
         {
+            if (executeContextCommand && TryRepeatObservedOrder()) return;
             _ui.Notify("Дух не видит подходящий объект.");
             return;
         }
@@ -1134,9 +1120,7 @@ public sealed class SpiritController : MonoBehaviour
         {
             if (executeContextCommand)
             {
-                var maximumPoints = _progression.Level >= 25 ? 6 : _progression.Level >= 15 ? 3 : 1;
-                _markers.SetUnload(hit.point + hit.normal * 0.06f, maximumPoints);
-                _ui.Notify("Сундук назначен точкой разгрузки.");
+                AssignContainer(container);
             }
             else _ui.Notify("Контейнер. Дух может разгружать сюда предметы при наличии доступа.", 6f);
             return;
@@ -1151,8 +1135,7 @@ public sealed class SpiritController : MonoBehaviour
         {
             if (executeContextCommand)
             {
-                _markers.SetWorkZone(hit.point, WorkRadius, _config.ShowWorkZone.Value);
-                _ui.Notify("Здесь назначена рабочая зона.");
+                HandleSpiritPing(hit.point, true);
             }
             else _ui.Notify($"Неизвестный объект: {hit.collider.gameObject.name}.", 6f);
             return;
@@ -1160,32 +1143,12 @@ public sealed class SpiritController : MonoBehaviour
         if (executeContextCommand)
         {
             SetExactFilter(definition.Name, ResourceName(definition.Name));
+            _lastResourcePingAt = Time.unscaledTime;
             SetJob(definition.Category == ResourceCategory.Wood ? SpiritJob.Woodcutting :
                 definition.Category is ResourceCategory.Ore or ResourceCategory.Stone ? SpiritJob.Mining : SpiritJob.Gathering);
             return;
         }
-        _ui.Notify($"{ResourceName(definition.Name)}\nИнструмент: {definition.RequiredToolType}, tier {definition.MinToolTier}\nУровень духа: {definition.RequiredSpiritLevel}; профессии: {definition.RequiredProfessionLevel}\nАвтодобыча: {(definition.CanAutoHarvest ? "да" : "нет")}", 8f);
-    }
-
-    private void ConfigureCourier()
-    {
-        var player = Player.m_localPlayer;
-        if (!player || !TryPlacementPoint(player, out var point)) { _ui.Notify("Не удалось определить точку маршрута."); return; }
-        var route = _progression.Data.Automation.CourierRoute;
-        if (!_courierAwaitingDestination)
-        {
-            route.Source = ToArray(point);
-            route.Resource = _resourceSelection.ExactName;
-            route.Enabled = false;
-            _courierAwaitingDestination = true;
-            _ui.Notify("Источник маршрута A установлен. Наведитесь на точку B и выберите команду ещё раз.", 6f);
-            return;
-        }
-        route.Destination = ToArray(point);
-        route.Enabled = true;
-        _courierAwaitingDestination = false;
-        _ui.Notify("Маршрут почтальона A → B активирован.");
-        SetJob(SpiritJob.Courier);
+        _ui.ShowReport(ResourceName(definition.Name), $"Инструмент: {definition.RequiredToolType}, tier {definition.MinToolTier}\nУровень духа: {definition.RequiredSpiritLevel}; профессии: {definition.RequiredProfessionLevel}\nАвтодобыча: {(definition.CanAutoHarvest ? "да" : "нет")}");
     }
 
     private void SaveNamedZone()
@@ -1196,6 +1159,16 @@ public sealed class SpiritController : MonoBehaviour
         var sameTypeCount = 0;
         foreach (var zone in zones) if (zone.Type == _selectedNamedZoneType) sameTypeCount++;
         var name = $"{_selectedNamedZoneType} {sameTypeCount + 1}";
+        if (!string.IsNullOrWhiteSpace(_selectedZoneName)) name = _selectedZoneName;
+        var camera = Camera.main;
+        if (camera && Physics.Raycast(camera.transform.position, camera.transform.forward, out var hit, 40f,
+                Physics.AllLayers, QueryTriggerInteraction.Ignore) && hit.collider.GetComponentInParent<Sign>() is { } sign)
+        {
+            var signName = sign.GetText().Trim();
+            if (!string.IsNullOrWhiteSpace(signName) && !signName.StartsWith("Spirit:", StringComparison.OrdinalIgnoreCase))
+                name = signName.Length > 60 ? signName.Substring(0, 60) : signName;
+        }
+        zones.RemoveAll(zone => string.Equals(zone.Name, name, StringComparison.OrdinalIgnoreCase));
         zones.Add(new NamedZoneData { Name = name, Type = _selectedNamedZoneType, Position = ToArray(point), Radius = WorkRadius });
         _activeNamedZoneIndex = zones.Count - 1;
         _markers.SetWorkZone(point, WorkRadius, _config.ShowWorkZone.Value);
@@ -1208,6 +1181,7 @@ public sealed class SpiritController : MonoBehaviour
         if (zones.Count == 0) { _ui.Notify("Именованных зон пока нет."); return; }
         _activeNamedZoneIndex = (_activeNamedZoneIndex + 1) % zones.Count;
         var zone = zones[_activeNamedZoneIndex];
+        _config.WorkRadius.Value = zone.Radius;
         _markers.SetWorkZone(SpiritKnowledge.ToVector(zone.Position), zone.Radius, _config.ShowWorkZone.Value);
         _ui.Notify($"Активна зона «{zone.Name}».");
     }
@@ -1219,8 +1193,29 @@ public sealed class SpiritController : MonoBehaviour
         var automation = _progression.Data.Automation;
         automation.ShrineSet = true;
         automation.ShrinePosition = ToArray(point);
-        _markers.ShowTemporaryMarker(point, new Color(0.65f, 0.35f, 1f), 86400f);
-        _ui.Notify("Локальный алтарь духа установлен. Он не создаёт сетевой prefab.");
+        _markers.SetShrine(point, automation.ShrineLevel);
+        _ui.Notify("Алтарь духа установлен.");
+    }
+
+    private void RemoveShrine()
+    {
+        var automation = _progression.Data.Automation;
+        if (!automation.ShrineSet)
+        {
+            _ui.Notify("Алтарь духа не установлен.");
+            return;
+        }
+
+        automation.ShrineSet = false;
+        automation.ShrinePosition = new float[3];
+        _markers.RemoveShrine();
+        if (_guideLabel == "алтарь духа")
+        {
+            _guideDestination = null;
+            _guideLabel = string.Empty;
+        }
+        Persist();
+        _ui.Notify("Алтарь духа убран. Его уровень сохранён для следующей установки.");
     }
 
     private void UpgradeShrine()
@@ -1241,6 +1236,7 @@ public sealed class SpiritController : MonoBehaviour
         if (cores == null) { _ui.Notify($"Для улучшения нужно Surtling Core ×{requiredCores}."); return; }
         inventory.RemoveItem(cores, requiredCores);
         automation.ShrineLevel++;
+        _markers.SetShrine(SpiritKnowledge.ToVector(automation.ShrinePosition), automation.ShrineLevel);
         AddJournal($"Алтарь улучшен до уровня {automation.ShrineLevel}.");
         _ui.Notify($"Алтарь улучшен до уровня {automation.ShrineLevel}: зарядка, радиус и дальние задания усилены.", 6f);
     }
@@ -1252,6 +1248,7 @@ public sealed class SpiritController : MonoBehaviour
         _guideDestination = SpiritKnowledge.ToVector(automation.ShrinePosition);
         _guideLabel = "алтарь духа";
         _jobBeforeRest = _job;
+        _resumeAfterRest = true;
         _job = SpiritJob.Rest;
     }
 
@@ -1351,6 +1348,7 @@ public sealed class SpiritController : MonoBehaviour
 
     private void ToggleSchedule()
     {
+        if (_progression.Level < 25) { _ui.Notify("Расписание открывается на уровне 25."); return; }
         _scheduleEnabled = !_scheduleEnabled;
         var schedule = _progression.Data.Automation.Schedule;
         if (_scheduleEnabled && schedule.Count == 0)
@@ -1365,6 +1363,7 @@ public sealed class SpiritController : MonoBehaviour
 
     private void ToggleRules()
     {
+        if (_progression.Level < 25) { _ui.Notify("Правила открываются на уровне 25."); return; }
         _rulesEnabled = !_rulesEnabled;
         var rules = _progression.Data.Automation.Rules;
         if (_rulesEnabled && rules.Count == 0)
@@ -1384,13 +1383,13 @@ public sealed class SpiritController : MonoBehaviour
         if (memory.Count == 0) { _ui.Notify("Память мира пока пуста. Используйте разведку."); return; }
         var lines = new List<string>();
         var player = Player.m_localPlayer;
-        for (var index = Math.Max(0, memory.Count - 6); index < memory.Count; index++)
+        for (var index = 0; index < memory.Count; index++)
         {
             var entry = memory[index];
             var distance = player ? Vector3.Distance(player.transform.position, SpiritKnowledge.ToVector(entry.Position)) : 0f;
             lines.Add($"{ResourceName(entry.Resource)} — {distance:0} м, день {entry.LastSeenDay}{(entry.Depleted ? " (истощено)" : string.Empty)}");
         }
-        _ui.Notify("Память мира\n" + string.Join("\n", lines), 10f);
+        _ui.ShowReport("Память мира", string.Join("\n", lines));
     }
 
     private void FindLostItems()
@@ -1399,12 +1398,13 @@ public sealed class SpiritController : MonoBehaviour
         if (!player) return;
         var hits = Physics.OverlapSphere(player.transform.position, WorkRadius, Physics.AllLayers, QueryTriggerInteraction.Collide);
         var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var seenDrops = new HashSet<int>();
         ResourceDefinition? nearestDefinition = null;
         var nearestDistance = float.MaxValue;
         foreach (var hit in hits)
         {
             var drop = hit ? hit.GetComponentInParent<ItemDrop>() : null;
-            if (!drop) continue;
+            if (!drop || !seenDrops.Add(drop.GetInstanceID())) continue;
             var definition = _resources.ByDrop(drop.gameObject.name);
             if (definition == null) continue;
             var name = drop.m_itemData.m_shared.m_name;
@@ -1428,14 +1428,31 @@ public sealed class SpiritController : MonoBehaviour
         if (knowledge.Count == 0) { _ui.Notify("Дух ещё не изучил биомы."); return; }
         var lines = new List<string>();
         foreach (var biome in knowledge) lines.Add($"{biome.Biome}: {biome.Experience:0}%");
-        _ui.Notify("Знание биомов\n" + string.Join(" • ", lines), 9f);
+        _ui.ShowReport("Знание биомов", string.Join("\n", lines));
     }
 
     private void Prestige()
     {
         if (_progression.Level < 30) { _ui.Notify("Перерождение доступно на 30 уровне."); return; }
+        SetJob(SpiritJob.Follow);
+        _assignments.Clear();
+        _carry.Release();
+        _queueMode = false;
+        _rulesEnabled = false;
+        _scheduleEnabled = false;
+        _progression.Data.Automation.RulesEnabled = false;
+        _progression.Data.Automation.ScheduleEnabled = false;
+        _progression.Data.Automation.MaintainStock = 0;
+        _progression.Data.Automation.PendingOrders.Clear();
+        _progression.Data.Automation.CurrentOrder = null;
         var data = _progression.Data;
         data.Automation.Legacy = _knowledge.FavoriteResource;
+        _config.OrbColor.Value = data.Automation.Legacy switch
+        {
+            "Wood" or "Fine Wood" or "Core Wood" => "#62FF8B",
+            "Copper" or "Silver" or "Tin" => "#FFD65A",
+            _ => "#8C6CFF"
+        };
         data.Automation.PrestigeCount++;
         data.SpiritLevel = 1;
         data.SpiritXp = 0f;
@@ -1448,22 +1465,6 @@ public sealed class SpiritController : MonoBehaviour
         _celebrateUntil = Time.time + 5f;
         AddJournal($"Дух переродился. Наследие: {data.Automation.Legacy}.");
         _ui.Notify($"Дух переродился. Косметическое наследие: {data.Automation.Legacy}.", 8f);
-    }
-
-    private void LearnLookTarget()
-    {
-        var player = Player.m_localPlayer;
-        var component = LookComponent();
-        if (!player || !component) { _ui.Notify("Неизвестный объект не найден."); return; }
-        var weapon = player.GetCurrentWeapon();
-        var damage = weapon?.GetDamage() ?? default;
-        var tool = damage.m_chop > damage.m_pickaxe ? RequiredToolType.Axe : RequiredToolType.Pickaxe;
-        if (component is Pickable) tool = RequiredToolType.None;
-        var definition = _resources.Learn(component, tool);
-        _ui.SetResources(_resources.All);
-        _resourceSelection.SelectExact(definition.Name);
-        _ui.Notify($"Дух научился работать с prefab «{definition.Name}». Определение сохранено в конфиге.", 7f);
-        AddJournal($"Изучен новый ресурс: {definition.Name}.");
     }
 
     private ResourceDefinition? LookResource()
@@ -1493,259 +1494,6 @@ public sealed class SpiritController : MonoBehaviour
         _ => SpiritJob.Gathering
     };
 
-    private void TickLongTermProgress(Player player, float deltaTime)
-    {
-        var automation = _progression.Data.Automation;
-        automation.TimeTogetherSeconds += deltaTime;
-        var biome = player.GetCurrentBiome();
-        if (_knowledge.VisitBiome(biome, deltaTime)) AddJournal($"Впервые посещён биом {biome}.");
-        var isDead = player.IsDead();
-        if (isDead && !_wasDead)
-        {
-            automation.LastDeathPosition = ToArray(player.transform.position);
-            automation.HasLastDeathPosition = true;
-            if (_visual != null) _carry.Release(_visual.Transform.position);
-            AddJournal("Дух запомнил место гибели игрока.");
-        }
-        if (!isDead && _wasDead)
-        {
-            _celebrateUntil = Time.time + 2.5f;
-            _ui.Notify("Дух рад вашему возвращению.");
-        }
-        _wasDead = isDead;
-
-        var enemies = CountEnemies(player.transform.position, 25f);
-        var biomeFear = biome switch
-        {
-            Heightmap.Biome.Meadows => 1,
-            Heightmap.Biome.BlackForest => 5,
-            Heightmap.Biome.Swamp => 10,
-            Heightmap.Biome.Mountain => 15,
-            Heightmap.Biome.Plains => 20,
-            Heightmap.Biome.Mistlands => 25,
-            _ => 30
-        };
-        var shouldFear = enemies >= 4 || _progression.Level < biomeFear;
-        var stabilityChange = shouldFear ? -7f : _progression.Data.Personality == "Спокойный" ? 6f : 4f;
-        automation.Stability = Mathf.Clamp(automation.Stability + stabilityChange * deltaTime, 0f, 100f);
-        if (_progression.Data.Personality == "Осторожный" && enemies > 0 && _job is not SpiritJob.Follow and not SpiritJob.Guard)
-        {
-            _jobBeforeRest = _job;
-            _job = SpiritJob.Follow;
-            _target = null;
-        }
-        if (automation.Stability < 20f && Time.time >= _lastSuggestion + 10f)
-        {
-            _lastSuggestion = Time.time;
-            _ui.Notify("✦ Дух напуган и держится ближе к игроку.", 4f);
-            _audio?.Play(SpiritAudioEvent.DangerDetected);
-        }
-        if (Time.time >= _nextEmotion)
-        {
-            _nextEmotion = Time.time + 15f;
-            var bossNearby = Character.GetAllCharacters().Any(character => character && character != player &&
-                !character.IsDead() && character.IsBoss() && Vector3.Distance(character.transform.position, player.transform.position) < 60f);
-            if (bossNearby) _ui.Notify("✦ Дух дрожит и прячется за вами: рядом могущественная угроза.", 5f);
-            else if (EnvMan.instance && EnvMan.instance.GetCurrentEnvironment().m_rainCloudAlpha > 0.65f)
-                _ui.Notify("✦ Вспышки грозы пробегают по духу.", 4f);
-            else if (player.IsSitting() && IsNearFire(player.transform.position))
-                _ui.Notify("✦ Дух спокойно отдыхает рядом с огнём.", 4f);
-        }
-        if (biome == Heightmap.Biome.Mistlands && Time.time >= _nextScoutReport)
-        {
-            var probe = player.transform.position + player.transform.forward * 6f + Vector3.up * 2f;
-            if (!Physics.Raycast(probe, Vector3.down, 12f, Physics.AllLayers, QueryTriggerInteraction.Ignore))
-            {
-                _nextScoutReport = Time.time + 5f;
-                _ui.Notify("✦ Впереди резкий обрыв.", 4f);
-                _audio?.Play(SpiritAudioEvent.DangerDetected);
-            }
-        }
-        if (_secretDetectorEnabled && Time.time >= _nextAdvancedTick)
-        {
-            _nextAdvancedTick = Time.time + 4f;
-            DetectNearbySecret(player.transform.position, 24f);
-        }
-        if (_baseAlarmEnabled)
-        {
-            var home = automation.NamedZones.Find(zone => zone.Type == NamedZoneType.Home);
-            if (home != null) TickBaseAlarm(player, SpiritKnowledge.ToVector(home.Position));
-        }
-    }
-
-    private void TickAutomationRules(Player player)
-    {
-        if (Time.time < _nextRulesTick) return;
-        _nextRulesTick = Time.time + 2f;
-        ReadWorkOrders(player);
-        if (_scheduleEnabled) ApplySchedule();
-        MaintainStock(player);
-        if (!_rulesEnabled) return;
-        var oldJob = _job;
-        if (EnergyRatio < 0.2f && _job != SpiritJob.Rest)
-        {
-            _jobBeforeRest = _job;
-            _job = SpiritJob.Rest;
-            _knowledge.RecordDecision("Rule: energy below 20% → recharge, then resume");
-        }
-        else if (CountEnemies(player.transform.position, 18f) > 0 && _job is not SpiritJob.Guard and not SpiritJob.Follow)
-        {
-            _jobBeforeRest = _job;
-            _job = SpiritJob.Follow;
-            _knowledge.RecordDecision("Rule: enemy nearby → return to player");
-        }
-        else if (_carry.IsFull(EffectiveCarryStacks, EffectiveCarryWeight))
-        {
-            _forceDelivery = true;
-            _knowledge.RecordDecision("Rule: cargo >= 80% → deliver and resume");
-        }
-        if (oldJob != _job) _target = null;
-    }
-
-    private void ReadWorkOrders(Player player)
-    {
-        var hits = Physics.OverlapSphere(player.transform.position, WorkRadius, Physics.AllLayers, QueryTriggerInteraction.Collide);
-        foreach (var hit in hits)
-        {
-            var sign = hit ? hit.GetComponentInParent<Sign>() : null;
-            if (!sign) continue;
-            var text = sign.GetText().Trim();
-            if (!text.StartsWith("Spirit:", StringComparison.OrdinalIgnoreCase) || text == _lastWorkOrder) continue;
-            var parts = text.Substring(7).Trim().Split(new[] { ' ', ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 0) continue;
-            var definition = _resources.All.FirstOrDefault(item =>
-                string.Equals(item.Name, parts[0], StringComparison.OrdinalIgnoreCase));
-            if (definition == null) continue;
-            var quantity = 0;
-            if (parts.Length > 1) int.TryParse(parts[1], out quantity);
-            _lastWorkOrder = text;
-            _resourceSelection.SelectExact(definition.Name);
-            _selectedQuantity = Mathf.Max(0, quantity);
-            _markers.SetWorkZone(sign.transform.position, WorkRadius, _config.ShowWorkZone.Value);
-            SetJob(JobFor(definition));
-            _knowledge.RecordDecision($"Work order sign: {definition.Name} x{quantity}");
-            _ui.Notify($"Получен Work Order: {ResourceName(definition.Name)} × {(quantity == 0 ? "∞" : quantity.ToString())}.", 7f);
-            return;
-        }
-    }
-
-    private void MaintainStock(Player player)
-    {
-        var targetStock = _progression.Data.Automation.MaintainStock;
-        if (targetStock <= 0 || _resourceSelection.Mode != ResourceFilterMode.Exact) return;
-        var definition = _resources.All.FirstOrDefault(item => item.Name == _resourceSelection.ExactName);
-        if (definition == null) return;
-        var total = 0;
-        var seen = new HashSet<int>();
-        var hits = Physics.OverlapSphere(player.transform.position, WorkRadius, Physics.AllLayers, QueryTriggerInteraction.Collide);
-        foreach (var hit in hits)
-        {
-            var container = hit ? hit.GetComponentInParent<Container>() : null;
-            if (!container || !seen.Add(container.GetInstanceID()) ||
-                !PrivateArea.CheckAccess(container.transform.position, 0f, false, false)) continue;
-            foreach (var dropName in definition.DropNames) total += container.GetInventory().CountItems(dropName, -1, true);
-        }
-        if (total >= targetStock)
-        {
-            if (_job == JobFor(definition)) _job = SpiritJob.Follow;
-            return;
-        }
-        if (_job is SpiritJob.Follow or SpiritJob.Rest)
-        {
-            _job = JobFor(definition);
-            _assignmentQuantity = targetStock - total;
-            _assignmentProgress = 0;
-            _ui.Notify($"Запас {ResourceName(definition.Name)} ниже цели: {total}/{targetStock}. Работа возобновлена.");
-        }
-    }
-
-    private void ApplySchedule()
-    {
-        if (!EnvMan.instance) return;
-        var hour = EnvMan.instance.GetDayFraction() * 24f;
-        foreach (var entry in _progression.Data.Automation.Schedule)
-        {
-            var active = entry.StartHour <= entry.EndHour
-                ? hour >= entry.StartHour && hour < entry.EndHour
-                : hour >= entry.StartHour || hour < entry.EndHour;
-            if (!active || _job == entry.Job) continue;
-            _job = entry.Job;
-            _target = null;
-            _knowledge.RecordDecision($"Schedule → {entry.Job}");
-            break;
-        }
-    }
-
-    private void TickBaseAlarm(Player player, Vector3 centre)
-    {
-        var enemies = CountEnemies(centre, 25f);
-        if (enemies == 0 || Time.time < _nextGuardNotice) return;
-        _nextGuardNotice = Time.time + 8f;
-        var direction = centre - player.transform.position;
-        _ui.Notify($"⚠ Опасность у дома: {enemies} враг(а), направление {DirectionName(direction)}.", 6f);
-        _audio?.Play(SpiritAudioEvent.DangerDetected);
-    }
-
-    private void TickThreatWarning(Player player, float radius)
-    {
-        var enemies = CountEnemies(player.transform.position, radius);
-        if (enemies == 0 || Time.time < _nextGuardNotice) return;
-        _nextGuardNotice = Time.time + 6f;
-        _ui.Notify($"✦ Впереди опасность: {enemies} враг(а).", 4f);
-        _audio?.Play(SpiritAudioEvent.DangerDetected);
-    }
-
-    private static int CountEnemies(Vector3 centre, float radius)
-    {
-        var squaredRadius = radius * radius;
-        var player = Player.m_localPlayer;
-        var count = 0;
-        foreach (var character in Character.GetAllCharacters())
-            if (character && player && character != player && !character.IsDead() && BaseAI.IsEnemy(player, character) &&
-                Vector3.SqrMagnitude(character.transform.position - centre) <= squaredRadius) count++;
-        return count;
-    }
-
-    private static bool IsNearFire(Vector3 centre)
-    {
-        var hits = Physics.OverlapSphere(centre, 8f, Physics.AllLayers, QueryTriggerInteraction.Collide);
-        foreach (var hit in hits)
-        {
-            if (!hit) continue;
-            var name = hit.gameObject.name.ToLowerInvariant();
-            if (name.Contains("fire") || name.Contains("hearth") || name.Contains("bonfire")) return true;
-        }
-        return false;
-    }
-
-    private void DetectNearbySecret(Vector3 centre, float radius)
-    {
-        var hits = Physics.OverlapSphere(centre, radius, Physics.AllLayers, QueryTriggerInteraction.Collide);
-        foreach (var hit in hits)
-        {
-            if (!hit) continue;
-            var name = hit.gameObject.name.ToLowerInvariant();
-            if (!name.Contains("chest") && !name.Contains("vegvisir") && !name.Contains("boss") &&
-                !name.Contains("location") && !name.Contains("rare")) continue;
-            var approximate = Vector3.Lerp(centre, hit.transform.position, 0.65f);
-            _markers.ShowTemporaryMarker(approximate, new Color(1f, 0.65f, 0.9f), 7f);
-            _ui.Notify("✦ Что-то заинтересовало духа...", 4f);
-            return;
-        }
-    }
-
-    private static string DirectionName(Vector3 direction)
-    {
-        direction.y = 0f;
-        if (direction.sqrMagnitude < 0.01f) return "рядом";
-        var angle = Mathf.Atan2(direction.x, direction.z) * Mathf.Rad2Deg;
-        if (angle < 0f) angle += 360f;
-        var directions = new[] { "север", "северо-восток", "восток", "юго-восток", "юг", "юго-запад", "запад", "северо-запад" };
-        return directions[Mathf.RoundToInt(angle / 45f) % directions.Length];
-    }
-
-    private static int CurrentDay() => EnvMan.instance ? EnvMan.instance.GetDay() : 0;
-
     private static string UnloadTypeName(UnloadPointType type) => type switch
     {
         UnloadPointType.Universal => "Любые ресурсы", UnloadPointType.Wood => "Древесина",
@@ -1767,6 +1515,7 @@ public sealed class SpiritController : MonoBehaviour
 
     private void CancelTarget(string reason)
     {
+        _visual?.ShowEmotion(SpiritEmotion.Frustrated);
         if (_target != null)
         {
             var key = _target.Component.GetInstanceID();
@@ -1788,6 +1537,12 @@ public sealed class SpiritController : MonoBehaviour
         if (!_config.EnergyEnabled.Value || _progression.Level >= 30) { _progression.Data.Energy = 100f; return; }
         if (_state is SpiritState.Rest or SpiritState.Recharge)
         {
+            var player = Player.m_localPlayer;
+            if (_visual == null || !player) return;
+            var nearPlayer = Vector3.Distance(_visual.Transform.position, player.transform.position) < 5f;
+            var nearShrine = _progression.Data.Automation.ShrineSet &&
+                Vector3.Distance(_visual.Transform.position, SpiritKnowledge.ToVector(_progression.Data.Automation.ShrinePosition)) < 4f;
+            if (!nearPlayer && !nearShrine) return;
             var shrineBonus = _progression.Data.Automation.ShrineSet && _visual != null &&
                 Vector3.Distance(_visual.Transform.position, SpiritKnowledge.ToVector(_progression.Data.Automation.ShrinePosition)) < 4f
                 ? 1f + _progression.Data.Automation.ShrineLevel * 0.5f : 1f;
@@ -1822,14 +1577,9 @@ public sealed class SpiritController : MonoBehaviour
         }
         var direction = Vector3.ProjectOnPlane(player.transform.forward, Vector3.up).normalized;
         var sample = player.transform.position + direction * 8f;
-        if (ZoneSystem.instance)
-        {
-            sample.y = ZoneSystem.instance.GetGroundHeight(sample);
-            point = sample;
-            return true;
-        }
-        var origin = sample + Vector3.up * 20f;
-        if (Physics.Raycast(origin, Vector3.down, out var groundHit, 60f, Physics.AllLayers, QueryTriggerInteraction.Ignore)) { point = groundHit.point; return true; }
+        var origin = sample + Vector3.up * 1.5f;
+        if (Physics.Raycast(origin, Vector3.down, out var groundHit, 6f, Physics.AllLayers, QueryTriggerInteraction.Ignore))
+        { point = groundHit.point + Vector3.up * 0.06f; return true; }
         point = default; return false;
     }
 
@@ -1856,12 +1606,14 @@ public sealed class SpiritController : MonoBehaviour
         data.HasForbiddenZone = _markers.HasForbiddenZone; data.ForbiddenZone = ToArray(_markers.ForbiddenZoneCentre);
         data.ResourceFilterMode = _resourceSelection.Mode; data.ResourceCategory = _resourceSelection.Category;
         data.SelectedResource = _resourceSelection.ExactName;
+        data.Automation.PendingOrders = _assignments.ToList();
+        if (data.Automation.CurrentOrder != null) data.Automation.CurrentOrder.Collected = _assignmentProgress;
         _saveManager.Save(_saveKey, data);
     }
 
     private void TrackRecentDrops()
     {
-        if (!_config.AutoCarry.Value || Time.time > _dropTrackingUntil) return;
+        if ((!_config.AutoCarry.Value && _assignmentQuantity == 0) || Time.time > _dropTrackingUntil || _finishingOrder) return;
         if (!_carry.TryCollect(_lastWorkPosition, EffectiveCarryStacks, EffectiveCarryWeight,
                 _resourceSelection, IsResourceForCurrentJob)) return;
         if (_carry.IsFull(EffectiveCarryStacks, EffectiveCarryWeight)) _forceDelivery = true;
@@ -1874,6 +1626,7 @@ public sealed class SpiritController : MonoBehaviour
             _config.SpiritXpMultiplier.Value, _config.ProfessionXpMultiplier.Value);
         if (!leveled) return;
         _celebrateUntil = Time.time + 2.2f;
+        _visual?.ShowEmotion(SpiritEmotion.Happy, 2.2f);
         _ui.Notify(_progression.Level > oldLevel
             ? $"Уровень духа повышен: {_progression.Level}!"
             : $"Уровень профессии повышен: {profession} {_progression.ProfessionLevel(profession)}!");
@@ -1894,8 +1647,8 @@ public sealed class SpiritController : MonoBehaviour
     {
         requiredLevel = job switch
         {
-            SpiritJob.Transport => 3,
-            SpiritJob.Scout => 10,
+            SpiritJob.Transport or SpiritJob.Bring or SpiritJob.Caravan => 3,
+            SpiritJob.Scout or SpiritJob.ExploreDungeon => 10,
             SpiritJob.Guard => 10,
             SpiritJob.Courier or SpiritJob.Sort => 15,
             SpiritJob.Production => 25,
@@ -1925,17 +1678,11 @@ public sealed class SpiritController : MonoBehaviour
 
     private float ActiveSpeedMultiplier => Time.time < _shrineBuffUntil ? _shrineSpeedMultiplier : 1f;
 
-    private void SuggestNextWork(Player player)
+    private void SuggestNextWork()
     {
         if (!_progression.Data.Automation.SuggestionsEnabled || Time.time < _lastSuggestion + 30f) return;
         _lastSuggestion = Time.time;
-        var remembered = _knowledge.FindNearest(_resourceSelection.ExactName, player.transform.position);
-        if (remembered != null)
-        {
-            var direction = SpiritKnowledge.ToVector(remembered.Position) - player.transform.position;
-            _ui.Notify($"✦ Я помню {ResourceName(remembered.Resource)} на {DirectionName(direction)}. Продолжить там?", 6f);
-        }
-        else _ui.Notify("✦ В этой зоне больше нет выбранных ресурсов. Можно перенести рабочую зону.", 5f);
+        _ui.Notify($"{_lastError}\nG → Спутник → Журнал и состояние → Почему ждёшь?", 7f);
     }
 
     private void EnsureIdentity(Player player)
@@ -1962,12 +1709,6 @@ public sealed class SpiritController : MonoBehaviour
         if (definition.Category == ResourceCategory.Wood) _progression.Data.TreesWorked++;
         else if (definition.Category is ResourceCategory.Ore or ResourceCategory.Stone) _progression.Data.OreWorked++;
         else _progression.Data.PlantsGathered++;
-        var resourceCount = _knowledge.RecordResource(definition.Name);
-        if (resourceCount == 500)
-        {
-            _ui.Notify($"{_progression.Data.SpiritName} получил сродство: {ResourceName(definition.Name)}.", 6f);
-            AddJournal($"Открыто сродство с ресурсом {definition.Name}.");
-        }
         _progression.Data.Bond += 0.1f;
     }
 
@@ -2010,6 +1751,12 @@ public sealed class SpiritController : MonoBehaviour
     {
         _target = null;
         _workAttempts = 0;
+        _awaitingTreeLog = false;
+        _collectDropsUntil = 0f;
+        _dropTrackingUntil = 0f;
+        _nextScan = 0f;
+        _lastError = string.Empty;
+        _visual?.ResetNavigation();
         _carry.CancelPending();
     }
 
@@ -2031,7 +1778,9 @@ public sealed class SpiritController : MonoBehaviour
     private void OnGUI()
     {
         if (_progression == null) return;
+        _ui.SetPlaces(_progression.Data.Automation.NamedZones.Select(zone => zone.Name).ToArray());
         var target = _target?.Definition.Name ?? "—";
+        _ui.SetTaskStatus($"{(_assignmentQuantity > 0 ? $"{_assignmentProgress}/{_assignmentQuantity}" : "Без лимита")} • очередь: {_assignments.Count}");
         var debug = $"State: {_state}\nJob: {_job}\nAssignment: {_assignmentProgress}/{QuantityName(_assignmentQuantity)}; queue: {_assignments.Count}\nTarget position: {_lastTargetPosition}\nBalance: {_config.BalanceMode.Value}\nEnergy: {_progression.Data.Energy:0.0}\nAttempts: {_workAttempts}\nLast error: {_lastError}";
         _ui.Draw(_config.EnableHud.Value, _progression, _state, _job, _progression.Data.Energy,
             ResourceName(target), _carry.Summary, FilterName(), _config.DebugMode.Value, debug);

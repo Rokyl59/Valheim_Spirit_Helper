@@ -22,6 +22,8 @@ public sealed class WorldMarkers
     {
         public Vector3 Position;
         public UnloadPointType Type;
+        public SavedContainerTarget ContainerTarget;
+        public string CustomResourceName = string.Empty;
         public GameObject Visual = null!;
     }
 
@@ -54,7 +56,9 @@ public sealed class WorldMarkers
         if (unloadPoints != null && unloadPoints.Count > 0)
         {
             foreach (var saved in unloadPoints)
-                if (saved.Position.Length == 3) AddUnload(new Vector3(saved.Position[0], saved.Position[1], saved.Position[2]), saved.Type);
+                if (saved.Position.Length == 3)
+                    AddUnload(new Vector3(saved.Position[0], saved.Position[1], saved.Position[2]), saved.Type,
+                        new SavedContainerTarget(saved.ContainerUserId, saved.ContainerId), saved.CustomResourceName);
         }
         else if (hasUnload && unload.Length == 3) AddUnload(new Vector3(unload[0], unload[1], unload[2]), unloadType);
         if (hasZone && zone.Length == 3) SetWorkZone(new Vector3(zone[0], zone[1], zone[2]), radius, showWorkZone);
@@ -65,35 +69,37 @@ public sealed class WorldMarkers
         if (hasZone && position.Length == 3) SetForbiddenZone(new Vector3(position[0], position[1], position[2]));
     }
 
-    public void SetUnload(Vector3 point, int maximumPoints = 1)
+    public void SetUnload(Vector3 point, int maximumPoints = 1, Container? container = null,
+        string customResourceName = "")
     {
         if (_unloadMarkers.Count >= maximumPoints)
         {
             if (maximumPoints == 1) RemoveUnload();
             else
             {
-                Object.Destroy(_unloadMarkers[0].Visual);
+                DestroyVisual(_unloadMarkers[0].Visual);
                 _unloadMarkers.RemoveAt(0);
             }
         }
-        AddUnload(point, UnloadType);
+        AddUnload(point, UnloadType, SavedContainerTarget.From(container), customResourceName);
     }
 
     public void RemoveUnload()
     {
         HasUnloadPoint = false;
-        foreach (var marker in _unloadMarkers) if (marker.Visual) Object.Destroy(marker.Visual);
+        foreach (var marker in _unloadMarkers) DestroyVisual(marker.Visual);
         _unloadMarkers.Clear();
-        if (_unloadVisual) Object.Destroy(_unloadVisual);
+        _unloadVisual = null;
     }
 
-    public void CycleUnloadType()
+    public void CycleUnloadType(string customResourceName = "")
     {
         UnloadType = (UnloadPointType)(((int)UnloadType + 1) % System.Enum.GetValues(typeof(UnloadPointType)).Length);
         if (!HasUnloadPoint) return;
         var last = _unloadMarkers[_unloadMarkers.Count - 1];
         last.Type = UnloadType;
-        Object.Destroy(last.Visual);
+        if (last.Type == UnloadPointType.Custom) last.CustomResourceName = customResourceName ?? string.Empty;
+        DestroyVisual(last.Visual);
         last.Visual = CreateUnloadVisual(last.Position, last.Type);
     }
 
@@ -120,26 +126,51 @@ public sealed class WorldMarkers
 
     public bool TryFindUnload(ResourceDefinition definition, ResourceSelection customSelection, Vector3 origin, out Vector3 point)
     {
+        return TryFindUnload(definition, customSelection, origin, out point, out _);
+    }
+
+    public bool TryFindUnload(ResourceDefinition definition, ResourceSelection customSelection, Vector3 origin, out Vector3 point,
+        out SavedContainerTarget containerTarget)
+    {
         var bestDistance = float.MaxValue;
+        var bestPriority = int.MaxValue;
         point = default;
+        containerTarget = default;
         var found = false;
         foreach (var marker in _unloadMarkers)
         {
-            if (!Accepts(marker.Type, definition, customSelection)) continue;
+            if (!Accepts(marker, definition, customSelection)) continue;
+            var priority = marker.Type == UnloadPointType.Universal ? 1 : 0;
             var distance = Vector3.SqrMagnitude(marker.Position - origin);
-            if (distance >= bestDistance) continue;
+            if (priority > bestPriority || priority == bestPriority && distance >= bestDistance) continue;
+            bestPriority = priority;
             bestDistance = distance;
             point = marker.Position;
+            containerTarget = marker.ContainerTarget;
             found = true;
         }
         return found;
+    }
+
+    public Container? ResolveContainer(Vector3 point)
+    {
+        foreach (var marker in _unloadMarkers)
+            if (Vector3.SqrMagnitude(marker.Position - point) < 0.01f) return marker.ContainerTarget.Resolve();
+        return null;
     }
 
     public List<SavedUnloadPoint> ExportUnloadPoints()
     {
         var saved = new List<SavedUnloadPoint>(_unloadMarkers.Count);
         foreach (var marker in _unloadMarkers)
-            saved.Add(new SavedUnloadPoint { Position = new[] { marker.Position.x, marker.Position.y, marker.Position.z }, Type = marker.Type });
+            saved.Add(new SavedUnloadPoint
+            {
+                Position = new[] { marker.Position.x, marker.Position.y, marker.Position.z },
+                Type = marker.Type,
+                ContainerUserId = marker.ContainerTarget.UserId,
+                ContainerId = marker.ContainerTarget.Id,
+                CustomResourceName = marker.CustomResourceName
+            });
         return saved;
     }
 
@@ -308,7 +339,7 @@ public sealed class WorldMarkers
 
     public void RemoveShrine()
     {
-        if (_shrineVisual) Object.Destroy(_shrineVisual);
+        DestroyVisual(_shrineVisual);
         _shrineVisual = null; _shrineLight = null; _shrineEnergyStream = null;
     }
 
@@ -332,8 +363,8 @@ public sealed class WorldMarkers
 
     public void Dispose()
     {
-        if (_unloadVisual) Object.Destroy(_unloadVisual);
-        foreach (var marker in _unloadMarkers) if (marker.Visual) Object.Destroy(marker.Visual);
+        foreach (var marker in _unloadMarkers) DestroyVisual(marker.Visual);
+        _unloadVisual = null;
         foreach (var marker in _temporaryMarkers) if (marker.Visual) Object.Destroy(marker.Visual);
         ClearNavigationTrail();
         RemoveShrine();
@@ -341,14 +372,22 @@ public sealed class WorldMarkers
         if (_forbiddenVisual) Object.Destroy(_forbiddenVisual);
     }
 
-    private void AddUnload(Vector3 point, UnloadPointType type)
+    private void AddUnload(Vector3 point, UnloadPointType type, SavedContainerTarget containerTarget = default,
+        string customResourceName = "")
     {
         HasUnloadPoint = true;
         UnloadPoint = point;
         UnloadType = type;
         var visual = CreateUnloadVisual(point, type);
         _unloadVisual = visual;
-        _unloadMarkers.Add(new UnloadMarker { Position = point, Type = type, Visual = visual });
+        _unloadMarkers.Add(new UnloadMarker
+        {
+            Position = point,
+            Type = type,
+            ContainerTarget = containerTarget,
+            CustomResourceName = customResourceName ?? string.Empty,
+            Visual = visual
+        });
     }
 
     private static GameObject CreateUnloadVisual(Vector3 point, UnloadPointType type)
@@ -359,16 +398,35 @@ public sealed class WorldMarkers
         return visual;
     }
 
-    private static bool Accepts(UnloadPointType type, ResourceDefinition definition, ResourceSelection customSelection) => type switch
+    private static bool Accepts(UnloadMarker marker, ResourceDefinition definition, ResourceSelection customSelection) => marker.Type switch
     {
         UnloadPointType.Wood => definition.Category == ResourceCategory.Wood,
         UnloadPointType.Ore => definition.Category == ResourceCategory.Ore,
         UnloadPointType.Stone => definition.Category == ResourceCategory.Stone,
         UnloadPointType.Plants => definition.Category == ResourceCategory.Plant,
         UnloadPointType.Food => definition.Category == ResourceCategory.Food,
-        UnloadPointType.Custom => customSelection.Allows(definition),
+        UnloadPointType.Custom => string.IsNullOrEmpty(marker.CustomResourceName)
+            ? customSelection.Allows(definition)
+            : MatchesCustomResource(definition, marker.CustomResourceName),
         _ => true
     };
+
+    private static bool MatchesCustomResource(ResourceDefinition definition, string resourceName)
+    {
+        var selection = new ResourceSelection();
+        selection.SelectExact(resourceName);
+        return selection.Allows(definition);
+    }
+
+    private static void DestroyVisual(GameObject? visual)
+    {
+        if (!visual) return;
+        var materials = new HashSet<Material>();
+        foreach (var renderer in visual.GetComponentsInChildren<Renderer>())
+            if (renderer.sharedMaterial) materials.Add(renderer.sharedMaterial);
+        foreach (var material in materials) Object.Destroy(material);
+        Object.Destroy(visual);
+    }
 
     private static GameObject CreateRing(string name, Vector3 position, float radius, Color color, int segments,
         bool conformToTerrain)

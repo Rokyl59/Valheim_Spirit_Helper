@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using SpiritHelper.Resources;
 using UnityEngine;
 
 namespace SpiritHelper.Logistics.Production;
@@ -16,8 +17,8 @@ public sealed class ProductionLogisticsSystem
     }
 
     private const float InteractionDistance = 3.5f;
+    private const float OutputCollectionRadius = 4f;
     private const float RescanInterval = 3f;
-    private const float OwnershipTimeout = 5f;
     private const int MaximumFailures = 3;
     private const float FailureCooldown = 30f;
 
@@ -28,12 +29,14 @@ public sealed class ProductionLogisticsSystem
     private ItemDrop.ItemData? _reservedItem;
     private GameObject? _cargoVisual;
     private float _nextScanAt;
-    private float _claimStartedAt;
     private int _failures;
 
     public ProductionTaskState State { get; private set; }
     public bool HasReservedCargo => _reservedItem != null;
     public string ReservedItemName => _reservedItem?.m_shared.m_name ?? string.Empty;
+    public Func<Container, bool>? SourceAllowed { get; set; }
+    public Func<Vector3, bool>? IsForbidden { get; set; }
+    public Func<ItemDrop, ResourceSelection, bool>? OutputAllowed { get; set; }
 
     public ProductionTickResult Tick(Player player, Vector3 spiritPosition, Vector3 centre, float radius)
     {
@@ -51,7 +54,10 @@ public sealed class ProductionLogisticsSystem
                 return Result(ProductionTaskState.WaitingForWork, null, "Печи заполнены или в доступных сундуках нет сырья.");
         }
 
-        if (!_order.Machine || !_order.Source || !_order.ItemPrefab || !_order.Input)
+        if (!_order.Machine || !_order.Source || !_order.ItemPrefab || !_order.Input ||
+            IsForbidden?.Invoke(_order.Machine.transform.position) == true ||
+            IsForbidden?.Invoke(_order.Source.transform.position) == true ||
+            SourceAllowed?.Invoke(_order.Source) == false || _order.Source.IsInUse())
             return FailOrder(spiritPosition, "Производственная точка больше недоступна.");
 
         if (_reservedItem == null)
@@ -77,25 +83,49 @@ public sealed class ProductionLogisticsSystem
         State = ProductionTaskState.Idle;
     }
 
+    public Vector3? FindOutput(Vector3 centre, float radius, ResourceSelection selection)
+    {
+        var nearest = default(Vector3);
+        var nearestDistance = float.MaxValue;
+        var seenDrops = new HashSet<int>();
+        foreach (var machine in FindComponents<Smelter>(centre, radius))
+        {
+            if (!machine || IsForbidden?.Invoke(machine.transform.position) == true) continue;
+            var outputPrefabs = OutputPrefabNames(machine);
+            if (outputPrefabs.Count == 0) continue;
+
+            var count = Physics.OverlapSphereNonAlloc(machine.transform.position, OutputCollectionRadius, _hits,
+                Physics.AllLayers, QueryTriggerInteraction.Collide);
+            for (var index = 0; index < count; index++)
+            {
+                var drop = _hits[index] ? _hits[index].GetComponentInParent<ItemDrop>() : null;
+                if (!drop || !seenDrops.Add(drop.GetInstanceID()) || drop.m_itemData.m_stack <= 0 ||
+                    IsForbidden?.Invoke(drop.transform.position) == true) continue;
+                var prefabName = drop.m_itemData.m_dropPrefab ? drop.m_itemData.m_dropPrefab.name : string.Empty;
+                if (!outputPrefabs.Contains(prefabName) || !MatchesSelection(drop, selection)) continue;
+                var distance = Vector3.SqrMagnitude(drop.transform.position - centre);
+                if (distance >= nearestDistance) continue;
+                nearestDistance = distance;
+                nearest = drop.transform.position;
+            }
+        }
+        return nearestDistance < float.MaxValue ? nearest : null;
+    }
+
     private ProductionTickResult ClaimFromSource(Vector3 spiritPosition)
     {
         State = ProductionTaskState.ClaimingSource;
         var source = _order!.Source;
-        if (!PrivateArea.CheckAccess(source.transform.position, 0f, false, false))
+        if (source.IsInUse() || SourceAllowed?.Invoke(source) == false)
+            return FailOrder(spiritPosition, "Сундук с сырьём больше недоступен.");
+        if (!CarrySystem.CanAccessContainer(source))
             return FailOrder(spiritPosition, "Нет доступа к сундуку с сырьём.");
 
-        var view = source.GetComponent<ZNetView>();
-        if (!view || !view.IsValid()) return FailOrder(spiritPosition, "Сундук недоступен по сети.");
-        if (!view.IsOwner())
+        if (!source.IsOwner())
         {
-            if (_claimStartedAt <= 0f) _claimStartedAt = Time.time;
-            view.ClaimOwnership();
-            if (Time.time - _claimStartedAt > OwnershipTimeout)
-                return FailOrder(spiritPosition, "Не удалось получить владение сундуком.");
-            return Result(ProductionTaskState.ClaimingSource, source.transform.position, "Ожидаю доступ к сундуку.");
+            return Result(ProductionTaskState.ClaimingSource, source.transform.position, "Ожидаю владельца сундука.");
         }
 
-        _claimStartedAt = 0f;
         var inventory = source.GetInventory();
         var prefabName = _order.ItemPrefab.m_itemData.m_shared.m_name;
         var item = FindItem(inventory, prefabName);
@@ -124,14 +154,19 @@ public sealed class ProductionLogisticsSystem
         var inventory = player.GetInventory();
         var loan = _reservedItem!.Clone();
         loan.m_stack = 1;
+        var itemName = loan.m_shared.m_name;
+        var inventoryCount = inventory.CountItems(itemName, -1, false);
         if (!inventory.AddItem(loan))
             return FailOrder(spiritPosition, "В инвентаре игрока нет места для безопасного взаимодействия.");
 
-        var accepted = _order.Input.Interact(player, false, false);
-        var loanRemains = inventory.GetAllItems().Contains(loan);
-        if (loanRemains) inventory.RemoveItem(loan, 1);
-        if (!accepted || loanRemains)
+        var accepted = _order.Input.UseItem(player, loan);
+        var remainingCount = inventory.CountItems(itemName, -1, false);
+        if (!accepted || remainingCount != inventoryCount)
+        {
+            if (remainingCount > inventoryCount)
+                inventory.RemoveItem(itemName, 1, -1, false);
             return FailOrder(spiritPosition, "Постройка отклонила сырьё.");
+        }
 
         var delivered = DisplayName(_order.ItemPrefab);
         _reservedItem = null;
@@ -151,11 +186,14 @@ public sealed class ProductionLogisticsSystem
 
         foreach (var machine in machines)
         {
-            if (!machine || IsCoolingDown(machine) || !PrivateArea.CheckAccess(machine.transform.position, 0f, false, false)) continue;
+            if (!machine || IsCoolingDown(machine) || IsForbidden?.Invoke(machine.transform.position) == true ||
+                !PrivateArea.CheckAccess(machine.transform.position, 0f, false, false)) continue;
             foreach (var request in Requests(machine))
             foreach (var container in containers)
             {
-                if (!container || !PrivateArea.CheckAccess(container.transform.position, 0f, false, false)) continue;
+                if (!container || container.IsInUse() || SourceAllowed?.Invoke(container) == false ||
+                    IsForbidden?.Invoke(container.transform.position) == true || !container.IsOwner() ||
+                    !CarrySystem.CanAccessContainer(container)) continue;
                 if (FindItem(container.GetInventory(), request.Item.m_itemData.m_shared.m_name) == null) continue;
                 var score = Vector3.Distance(centre, container.transform.position) +
                             Vector3.Distance(container.transform.position, machine.transform.position);
@@ -177,17 +215,59 @@ public sealed class ProductionLogisticsSystem
 
     private static IEnumerable<(ItemDrop Item, Switch Input, bool IsFuel)> Requests(Smelter machine)
     {
-        if (machine.m_fuelItem && machine.m_addWoodSwitch && machine.GetFuel() + 0.01f < machine.m_maxFuel)
+        if (!TryGetMachineState(machine, out var state)) yield break;
+
+        if (machine.m_fuelItem && machine.m_addWoodSwitch && HasFuelCapacity(machine, state))
             yield return (machine.m_fuelItem, machine.m_addWoodSwitch, true);
 
-        if (!machine.m_addOreSwitch || machine.GetQueueSize() >= machine.m_maxOre) yield break;
+        if (!machine.m_addOreSwitch || state.GetInt(ZDOVars.s_queued, 0) >= machine.m_maxOre) yield break;
         foreach (var conversion in machine.m_conversion)
             if (conversion?.m_from) yield return (conversion.m_from, machine.m_addOreSwitch, false);
     }
 
-    private static bool StillNeedsItem(ProductionOrder order) => order.IsFuel
-        ? order.Machine.GetFuel() + 0.01f < order.Machine.m_maxFuel
-        : order.Machine.GetQueueSize() < order.Machine.m_maxOre && order.Machine.GetItemConversion(order.ItemPrefab.m_itemData.m_shared.m_name) != null;
+    private static bool StillNeedsItem(ProductionOrder order)
+    {
+        if (!TryGetMachineState(order.Machine, out var state)) return false;
+        if (order.IsFuel) return HasFuelCapacity(order.Machine, state);
+        return state.GetInt(ZDOVars.s_queued, 0) < order.Machine.m_maxOre &&
+               AcceptsItem(order.Machine, order.ItemPrefab.gameObject.name);
+    }
+
+    private static bool TryGetMachineState(Smelter machine, out ZDO state)
+    {
+        state = null!;
+        var view = machine.GetComponent<ZNetView>();
+        if (!view || !view.IsValid()) return false;
+        state = view.GetZDO();
+        return state != null;
+    }
+
+    private static bool HasFuelCapacity(Smelter machine, ZDO state) =>
+        state.GetFloat(ZDOVars.s_fuel, 0f) <= machine.m_maxFuel - 1f;
+
+    private static bool AcceptsItem(Smelter machine, string prefabName)
+    {
+        foreach (var conversion in machine.m_conversion)
+            if (conversion?.m_from && conversion.m_from.gameObject.name == prefabName) return true;
+        return false;
+    }
+
+    private static HashSet<string> OutputPrefabNames(Smelter machine)
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var conversion in machine.m_conversion)
+            if (conversion?.m_to) names.Add(conversion.m_to.gameObject.name);
+        return names;
+    }
+
+    private bool MatchesSelection(ItemDrop drop, ResourceSelection selection)
+    {
+        if (OutputAllowed != null) return OutputAllowed(drop, selection);
+        if (selection.Mode != ResourceFilterMode.Exact) return true;
+        var prefabName = drop.m_itemData.m_dropPrefab ? drop.m_itemData.m_dropPrefab.name : string.Empty;
+        return prefabName.Equals(selection.ExactName, StringComparison.OrdinalIgnoreCase) ||
+               drop.m_itemData.m_shared.m_name.Equals(selection.ExactName, StringComparison.OrdinalIgnoreCase);
+    }
 
     private List<T> FindComponents<T>(Vector3 centre, float radius) where T : Component
     {
@@ -223,10 +303,10 @@ public sealed class ProductionLogisticsSystem
     private void RestoreReservedItem(Vector3 fallbackPoint)
     {
         if (_reservedItem == null) return;
-        if (_order?.Source && PrivateArea.CheckAccess(_order.Source.transform.position, 0f, false, false))
+        if (_order?.Source && _order.Source.IsOwner() &&
+            CarrySystem.CanAccessContainer(_order.Source))
         {
-            var view = _order.Source.GetComponent<ZNetView>();
-            if (view && view.IsValid() && view.IsOwner() && _order.Source.GetInventory().AddItem(_reservedItem))
+            if (_order.Source.GetInventory().AddItem(_reservedItem))
             {
                 _reservedItem = null;
                 DestroyCargoVisual();
@@ -282,7 +362,6 @@ public sealed class ProductionLogisticsSystem
     private void ResetOrder()
     {
         _order = null;
-        _claimStartedAt = 0f;
     }
 
     private ProductionTickResult Result(ProductionTaskState state, Vector3? destination, string status)
@@ -291,6 +370,5 @@ public sealed class ProductionLogisticsSystem
         return new ProductionTickResult(state, destination, status, false);
     }
 
-    private static string DisplayName(ItemDrop item) =>
-        Localization.instance ? Localization.instance.Localize(item.m_itemData.m_shared.m_name) : item.m_itemData.m_shared.m_name;
+    private static string DisplayName(ItemDrop item) => item.m_itemData.m_shared.m_name;
 }

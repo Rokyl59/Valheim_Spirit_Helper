@@ -13,6 +13,7 @@ public sealed class SpiritHelperPlugin : BaseUnityPlugin
     public const string PluginVersion = "0.5.0";
     internal static ManualLogSource Log = null!;
     private SpiritController? _controller;
+    private readonly SpiritInputBridge _inputBridge = new SpiritInputBridge();
 
     private void Awake()
     {
@@ -20,8 +21,15 @@ public sealed class SpiritHelperPlugin : BaseUnityPlugin
         var config = new SpiritConfig(Config);
         _controller = gameObject.AddComponent<SpiritController>();
         _controller.Initialize(config);
+        SpiritInputBridge.MenuIsOpen = () => _controller != null && _controller.MenuOpen;
+        SpiritInputBridge.PingReceived = _controller.HandleSpiritPing;
+        _inputBridge.Initialize();
         Logger.LogInfo($"{PluginName} {PluginVersion} loaded; no custom network objects registered.");
     }
 
-    private void OnDestroy() => _controller?.Shutdown();
+    private void OnDestroy()
+    {
+        _inputBridge.Dispose();
+        _controller?.Shutdown();
+    }
 }

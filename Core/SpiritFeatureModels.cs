@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using SpiritHelper.Resources;
 
 namespace SpiritHelper.Core;
 
@@ -27,6 +28,10 @@ public sealed class CourierRouteData
     public bool Enabled;
     public float[] Source = new float[3];
     public float[] Destination = new float[3];
+    public long SourceContainerUserId;
+    public uint SourceContainerId;
+    public long DestinationContainerUserId;
+    public uint DestinationContainerId;
     public string Resource = string.Empty;
 }
 
@@ -71,6 +76,11 @@ public sealed class DecisionRecordData
 [Serializable]
 public sealed class SpiritAutomationData
 {
+    public SpiritOrderData? CurrentOrder;
+    public SpiritOrderData? ObservedOrder;
+    public List<SpiritOrderData> PendingOrders = new List<SpiritOrderData>();
+    public List<IgnoredTargetData> IgnoredTargets = new List<IgnoredTargetData>();
+    public SpiritJob CompletionJob = SpiritJob.Follow;
     public List<KnownResourceData> WorldMemory = new List<KnownResourceData>();
     public List<NamedZoneData> NamedZones = new List<NamedZoneData>();
     public CourierRouteData CourierRoute = new CourierRouteData();
@@ -102,4 +112,30 @@ public sealed class SpiritAutomationData
     public bool HasLastBoatPosition;
     public float[] LastBedPosition = new float[3];
     public bool HasLastBedPosition;
+}
+
+[Serializable]
+public sealed class SpiritOrderData
+{
+    public SpiritJob Job;
+    public int Quantity;
+    public int Collected;
+    public int Delivered;
+    public ResourceFilterMode FilterMode;
+    public ResourceCategory Category;
+    public string Resource = string.Empty;
+    public bool HasWorkZone;
+    public float[] WorkZone = new float[3];
+    public float Radius;
+    public WorkZoneMode ZoneMode;
+    public SpiritJob CompletionJob = SpiritJob.Follow;
+    public bool HasDeliveryPoint;
+    public float[] DeliveryPoint = new float[3];
+}
+
+[Serializable]
+public sealed class IgnoredTargetData
+{
+    public string Prefab = string.Empty;
+    public float[] Position = new float[3];
 }

@@ -10,6 +10,7 @@ namespace SpiritHelper.Progression;
 public sealed class SpiritKnowledge
 {
     private const float SameResourceDistance = 4f;
+    private const int MaximumWorldMemoryEntries = 500;
     private readonly SpiritSaveData _data;
 
     public SpiritKnowledge(SpiritSaveData data) => _data = data;
@@ -40,6 +41,7 @@ public sealed class SpiritKnowledge
             Position = ToArray(position),
             LastSeenDay = day
         });
+        TrimWorldMemory();
         return true;
     }
 
@@ -56,6 +58,19 @@ public sealed class SpiritKnowledge
             .OrderBy(entry => Vector3.SqrMagnitude(ToVector(entry.Position) - position))
             .FirstOrDefault();
         if (nearest != null && Vector3.Distance(ToVector(nearest.Position), position) <= 6f) nearest.Depleted = true;
+    }
+
+    private void TrimWorldMemory()
+    {
+        var memory = _data.Automation.WorldMemory;
+        while (memory.Count > MaximumWorldMemoryEntries)
+        {
+            var remove = memory
+                .OrderByDescending(entry => entry.Depleted)
+                .ThenBy(entry => entry.LastSeenDay)
+                .First();
+            memory.Remove(remove);
+        }
     }
 
     public bool VisitBiome(Heightmap.Biome biome, float deltaTime)

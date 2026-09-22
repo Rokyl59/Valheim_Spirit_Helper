@@ -11,6 +11,8 @@ public enum ResourceDamageType { None, Chop, Pickaxe, Interact }
 public sealed class ResourceDefinition
 {
     public string Name { get; }
+    public string DisplayName { get; }
+    public string SourceResourceName { get; }
     public ResourceCategory Category { get; }
     public HashSet<string> PrefabNames { get; }
     public HashSet<string> DropNames { get; }
@@ -32,9 +34,12 @@ public sealed class ResourceDefinition
         IEnumerable<string> drops, int professionLevel, RequiredToolType tool, int tier,
         ResourceDamageType damageType, float energyCost, float xp, Profession profession,
         int spiritLevel = 1, float searchRadius = 50f, float workInterval = 1.5f,
-        float? professionXp = null, bool canAutoHarvest = true, bool canAutoTransport = true)
+        float? professionXp = null, bool canAutoHarvest = true, bool canAutoTransport = true,
+        string? displayName = null, string? sourceResourceName = null)
     {
         Name = name;
+        DisplayName = string.IsNullOrWhiteSpace(displayName) ? name : displayName;
+        SourceResourceName = string.IsNullOrWhiteSpace(sourceResourceName) ? name : sourceResourceName;
         Category = category;
         PrefabNames = new HashSet<string>(prefabs, StringComparer.OrdinalIgnoreCase);
         DropNames = new HashSet<string>(drops, StringComparer.OrdinalIgnoreCase);
